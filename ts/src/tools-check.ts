@@ -4,13 +4,15 @@
 // The gas-key signer is checked against commands built by the SAME builder deploy.ts uses, with a
 // throwaway in-memory key: it must sign the deploy's two commands and refuse every altered one, each
 // for the one reason code it names (every guard has its own code, so a refusal cannot drift to a
-// neighbouring guard unnoticed).
+// neighbouring guard unnoticed). The checks made before anything is signed, the rules for commands
+// signed elsewhere, and what a preflight sends in each mode are checked the same way.
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { genKeyPair, hash as blakeHash } from '@kadena/cryptography-utils';
 import {
   ROOT, parseChains, parseBinaryHeader, pactTime, microsOf,
   buildUnsignedGasOnly, keysetDeployCode, signGasSlot, validateKeyset, verifySigned, unsignedBody, commandKind,
+  fileChain, statusDecision, relayKind, preflightRequest,
   type Emitted, type DeployExpect,
 } from './lib.js';
 
@@ -110,6 +112,8 @@ refuses('refuses a module source one character off', () => sign(edit(modCmd, (c)
 refuses('refuses a different backfill keyset', () => sign(edit(ksCmd, (c) => { c.payload.exec.data.ks.keys[0] = K('a'); })), 'content-keyset');
 refuses('refuses a keyset command when no keyset is configured', () => sign(ksCmd, { ...X, keyset: null }), 'content-keyset-missing');
 refuses('refuses a keyset command whose configured keyset is invalid (no keys)', () => { const empty = { keys: [] as string[], pred: 'keys-all' }; return sign(buildUnsignedGasOnly({ ...common, code: keysetDeployCode('free'), data: { ks: empty }, gasLimit: 2000 }), { ...X, keyset: empty }); }, 'content-keyset-invalid');
+refuses('refuses a module command when no keyset is configured (it could only be sent where that keyset is ours)', () => sign(modCmd, { ...X, keyset: null }), 'content-keyset-missing');
+refuses('refuses a module command whose configured keyset is invalid (no keys)', () => sign(modCmd, { ...X, keyset: { keys: [], pred: 'keys-all' } }), 'content-keyset-invalid');
 refuses('refuses another namespace', () => sign(edit(modCmd, (c) => { c.payload.exec.data.ns = 'user'; })), 'content-module');
 refuses('refuses extra transaction data', () => sign(edit(modCmd, (c) => { c.payload.exec.data.extra = 1; })), 'exact');
 refuses('refuses a changed time-to-live', () => sign(edit(ksCmd, (c) => { c.meta.ttl = 1e9; })), 'exact');
@@ -129,6 +133,35 @@ check('check-only body from a command with no signer list is empty, not a crash'
 check('classifies the keyset definition', commandKind(ksCmd.cmd, 'free', SRC), 'keyset');
 check('classifies the module deploy', commandKind(modCmd.cmd, 'free', SRC), 'module');
 check('classifies anything else as other', commandKind(edit(ksCmd, (c) => { c.payload.exec.code = '(free.block-history.close-backfill)'; }).cmd, 'free', SRC), 'other');
+const checkOnly = preflightRequest(signedKs, false);
+check('check-only preflight: the command unchanged, signer slots with a public key alone, signatures not verified', [checkOnly.body.cmd === signedKs.cmd, (checkOnly.body.sigs as any[]).map((s) => Object.keys(s ?? {})), checkOnly.signatureVerification], [true, [['pubKey']], false]);
+check('send preflight: the signed command itself, signatures verified', preflightRequest(signedKs, true), { body: signedKs, signatureVerification: true });
+
+// ---- before anything is signed: the file's own integrity, and what its status on chain decides ------
+check('integrity: a file whose hash matches its command names its chain', fileChain(ksCmd), '0');
+refuses('integrity: a file whose hash does not match its command', () => fileChain({ ...ksCmd, cmd: ksCmd.cmd.replace('keys-2', 'keys-1') }), 'hash');
+refuses('integrity: a file with no command', () => fileChain({} as Emitted), 'hash');
+refuses('integrity: a chain id outside 0-19', () => fileChain(edit(ksCmd, (c) => { c.meta.chainId = '20'; })), 'chain');
+refuses('integrity: a chain id written as a number', () => fileChain(edit(ksCmd, (c) => { c.meta.chainId = 0; })), 'chain');
+check('status: a command the chain has not seen goes on', statusDecision(undefined), 'go');
+check('status: a command on chain that succeeded is skipped, however old', statusDecision({ result: { status: 'success', data: 'Write succeeded' } } as any), 'skip');
+check('status: a command on chain that failed stops the run', statusDecision({ result: { status: 'failure', error: { message: 'x' } } } as any), 'fail');
+check('status: a status that cannot be read is never a skip', statusDecision({} as any), 'fail');
+
+// ---- commands signed elsewhere -------------------------------------------------------------------
+const relayed = (t: Emitted, fn: (c: any) => void) => edit(t, fn).cmd;
+check('relay: the keyset definition carrying the configured keyset', relayKind(ksCmd.cmd, X), 'keyset');
+check('relay: the exact module command', relayKind(modCmd.cmd, X), 'module');
+check('relay: a backfill batch needs no keyset configured', relayKind(relayed(ksCmd, (c) => { c.payload.exec.code = "(free.block-history.backfill (read-msg 'rows))"; c.payload.exec.data = { rows: [] }; }), { ...X, keyset: null }), 'other');
+refuses('relay: a keyset definition carrying other keys', () => relayKind(relayed(ksCmd, (c) => { c.payload.exec.data.ks.keys[0] = K('a'); }), X), 'content-keyset');
+refuses('relay: a keyset definition when no keyset is configured', () => relayKind(ksCmd.cmd, { ...X, keyset: null }), 'content-keyset-missing');
+refuses('relay: a keyset definition whose configured keyset is invalid (no keys)', () => relayKind(ksCmd.cmd, { ...X, keyset: { keys: [], pred: 'keys-all' } }), 'content-keyset-invalid');
+refuses('relay: a module command when no keyset is configured', () => relayKind(modCmd.cmd, { ...X, keyset: null }), 'content-keyset-missing');
+refuses('relay: the module source into another namespace', () => relayKind(relayed(modCmd, (c) => { c.payload.exec.data.ns = 'user'; }), X), 'content-module');
+refuses('relay: a module source one character off', () => relayKind(relayed(modCmd, (c) => { c.payload.exec.code = SRC + ' '; }), X), 'content-definition');
+refuses('relay: an interface definition', () => relayKind(relayed(ksCmd, (c) => { c.payload.exec.code = '(interface i (defun f:bool ()))'; }), X), 'content-definition');
+refuses('relay: a module definition with a comment after its opening parenthesis', () => relayKind(relayed(ksCmd, (c) => { c.payload.exec.code = '(namespace "free") ( ; note\n  module m G (defcap G () true))'; }), X), 'content-definition');
+refuses('relay: the backfill keyset defined in another form', () => relayKind(relayed(ksCmd, (c) => { c.payload.exec.code = '(define-keyset "free.block-history-backfill" (read-keyset "ks"))'; }), X), 'content-definition');
 
 console.log(fails ? `\n${fails} check(s) FAILED` : '\nall tool checks passed');
 process.exit(fails ? 1 : 0);

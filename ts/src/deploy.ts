@@ -60,9 +60,11 @@ const backfillKeyset = (() => {
   try { return validateKeyset(JSON.parse(raw)); } catch (e: any) { throw new Error(`BH_BACKFILL_KEYSET: ${e?.message ?? e}`); }
 })();
 
-// One file per chain and command, so a re-run replaces its own stale file instead of adding a second.
+// One file per chain and command, so a re-run replaces its own stale file instead of adding a second, in a
+// directory per network, so files written for one network never sit beside another's.
+const UNSIGNED_DIR = join(OUT, 'unsigned', NETWORK_ID);
 const unsignedPath = (c: ChainId, label: string) =>
-  join(OUT, 'unsigned', `chain${String(c).padStart(2, '0')}-${label.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`);
+  join(UNSIGNED_DIR, `chain${String(c).padStart(2, '0')}-${label.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`);
 // The gas payer is the only signer, scoped to coin.GAS (lib.ts: buildUnsignedGasOnly). Sign and send
 // the files with `npm run send-signed -- --gas-key <key.json> …`, which accepts nothing else.
 async function writeUnsigned(s: TxSpec, signerKey: string): Promise<void> {
@@ -71,7 +73,7 @@ async function writeUnsigned(s: TxSpec, signerKey: string): Promise<void> {
     code: s.code, data: s.data ?? {}, chainId: s.chainId, sender: s.sender, signerPubKey: signerKey,
     gasLimit: s.gasLimit ?? MODULE_GAS_LIMIT, gasPrice: s.gasPrice, creationTime: Math.floor(now.getTime() / 1000) - 15,
   });
-  mkdirSync(join(OUT, 'unsigned'), { recursive: true });
+  mkdirSync(UNSIGNED_DIR, { recursive: true });
   const p = unsignedPath(s.chainId, s.label);
   writeFileSync(p, JSON.stringify(tx, null, 2) + '\n');
   console.log(`  ✎ chain ${s.chainId}: ${s.label} → ${p}`);
@@ -165,7 +167,7 @@ async function main() {
   const pending = results.filter((r) => r.status.startsWith('KEYSET command written'));
   if (pending.length) {
     console.log(`\n  ${pending.length} chain(s) need their KEYSET sent first: ${pending.map((r) => r.chain).join(',')}`);
-    console.log(`  Sign and send them (npm run send-signed -- --gas-key <key.json> [--send] out/unsigned/*.json), confirm with 'npm run preflight', then re-run this command for the module files.`);
+    console.log(`  Sign and send them (npm run send-signed -- --gas-key <key.json> [--send] out/unsigned/${NETWORK_ID}/*.json), confirm with 'npm run preflight', then re-run this command for the module files.`);
   }
   const hashes = new Set(results.filter((r) => !r.status.startsWith('KEYSET')).map((r) => r.hash));
   if (!UNSIGNED && hashes.size !== 1) throw new Error(`module hash differs across chains: ${[...hashes].join(' ')} — the same source in the same namespace must hash identically`);

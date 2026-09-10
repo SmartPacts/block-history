@@ -1,8 +1,8 @@
 // send-signed.ts — sign the gas payer's slot of the commands `deploy --unsigned` wrote, check every
 // one, and only with --send submit them, one at a time.
-//   npm run send-signed -- --gas-key <key.json> out/unsigned/*.json          check only
-//   npm run send-signed -- --gas-key <key.json> --send out/unsigned/*.json   sign, check, submit
-//   npm run send-signed -- [--send] <signed.json> …                           commands already signed elsewhere
+//   npm run send-signed -- --gas-key <key.json> out/unsigned/<network-id>/*.json          check only
+//   npm run send-signed -- --gas-key <key.json> --send out/unsigned/<network-id>/*.json   sign, check, submit
+//   npm run send-signed -- [--send] <signed.json> …                                       commands already signed elsewhere
 //
 // The key file is JSON {publicKey, secretKey}, readable by its owner alone (required for --send). Its
 // secret stays inside this process and is never printed. With --gas-key a file is signed only if it is,
@@ -10,17 +10,23 @@
 // definition carrying BH_BACKFILL_KEYSET, or the exact module source with {"ns": BH_NS}. It must also be
 // at BH_GAS_PRICE and within the deploy's gas limits, with one signature scoped to coin.GAS, and only
 // while the chain it names would still accept it.
+// Without --gas-key every signature a file carries must verify (lib.ts: verifySigned). Either way the
+// deploy's two commands must carry that same content, so neither is sent without BH_BACKFILL_KEYSET, and
+// a command signed elsewhere that defines any other module, interface or keyset is refused (lib.ts:
+// relayKind).
 // CHECK ONLY (no --send): nothing signed leaves this machine. Each command is preflighted on the node as
-// a body rebuilt with no signature (lib.ts: unsignedBody), whatever the file carries.
+// a body rebuilt with no signature (lib.ts: preflightRequest), whatever the file carries.
 // SEND: the maximum fee is printed first. A module command, signed here or elsewhere, is sent only on a
 // chain whose backfill keyset is already ours. Each command is preflighted, signed, immediately before
-// it is submitted. A command already on chain is skipped, so re-running after a partial session is safe.
+// it is submitted. A command already on chain is skipped before it is signed or checked, so re-running
+// after a partial session is safe however long ago it was.
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChainId, ICommand } from '@kadena/client';
 import {
   API, NETWORK_ID, NS, ROOT, GAS_PRICE, BACKFILL_KEYSET, client, retrying, pollMined, errorText, local, chainTime,
-  sameKeyset, signGasSlot, validateKeyset, verifySigned, unsignedBody, commandKind, type Emitted, type Keyset, type Signed,
+  sameKeyset, signGasSlot, validateKeyset, verifySigned, fileChain, statusDecision, relayKind, preflightRequest,
+  type Emitted, type Keyset, type Signed,
 } from './lib.js';
 
 function die(msg: string): never {
@@ -70,27 +76,36 @@ if (process.env.BH_BACKFILL_KEYSET) {
 const expect = { networkId: NETWORK_ID, ns: NS, source: SOURCE, keyset, gasPrice: GAS_PRICE };
 
 console.log(`send-signed → ${API}  ${doSend ? 'SEND' : '(check only — nothing signed leaves this machine)'}`);
-// Read every file first, then ask each chain it names for that chain's own time: a command is signed
-// only while its chain would still accept it.
-const loaded: { file: string; tx: Emitted; chainId: string }[] = [];
+// Read every file and check its hash and chain, then ask that chain, once, whether the command is already
+// there: one already on chain is skipped before it is signed or checked.
+const loaded: { file: string; tx: Emitted; chainId: ChainId }[] = [];
 for (const f of files) {
   let tx: Emitted | null = null;
   try { tx = JSON.parse(readFileSync(f, 'utf8')); } catch { die(`${f}: not a readable command file`); }
-  let chainId = '';
-  try { chainId = String(JSON.parse(tx!.cmd).meta.chainId); } catch { /* signGasSlot and verifySigned refuse it by name */ }
-  loaded.push({ file: f, tx: tx!, chainId });
+  try { loaded.push({ file: f, tx: tx!, chainId: fileChain(tx!) }); } catch (e: any) { die(`${f}: refused — ${e?.message ?? e}`); }
 }
+let skipped = 0;
+const pending: typeof loaded = [];
+for (const l of loaded) {
+  const d = { requestKey: l.tx.hash, chainId: l.chainId, networkId: NETWORK_ID };
+  const prior = (await retrying('status', () => client.getStatus(d)))[l.tx.hash];
+  const step = statusDecision(prior);
+  if (step === 'fail') die(`${l.file} is already on chain and FAILED there — ${errorText(prior)}`);
+  if (step === 'skip') { console.log(`  · already on chain, skipped: ${l.file}`); skipped++; }
+  else pending.push(l);
+}
+// A command is signed only while its chain would still accept it, so each chain is asked for its own time.
 const chainNow = new Map<string, number>();
 if (gasKey) {
-  for (const c of new Set(loaded.map((l) => l.chainId).filter((c) => /^1?[0-9]$/.test(c)))) {
-    try { chainNow.set(c, Math.floor((await chainTime(c as ChainId)).getTime() / 1000)); }
+  for (const c of new Set(pending.map((l) => l.chainId))) {
+    try { chainNow.set(c, Math.floor((await chainTime(c)).getTime() / 1000)); }
     catch { die(`could not read chain ${c}'s time from ${API}`); }
   }
 }
 
 type Item = { file: string; signed: Signed; chainId: ChainId; kind: 'keyset' | 'module' | 'other'; fee: number };
 const items: Item[] = [];
-for (const l of loaded) {
+for (const l of pending) {
   if (gasKey) {
     try {
       const r = signGasSlot(l.tx, gasKey, { ...expect, now: chainNow.get(l.chainId) ?? NaN });
@@ -100,7 +115,9 @@ for (const l of loaded) {
     const why = verifySigned(l.tx, NETWORK_ID);
     if (why) die(`${l.file}: not sendable — ${why}`);
     const c = JSON.parse(l.tx.cmd);
-    items.push({ file: l.file, signed: l.tx as Signed, chainId: String(c.meta.chainId) as ChainId, kind: commandKind(l.tx.cmd, NS, SOURCE), fee: Number(c.meta.gasLimit) * Number(c.meta.gasPrice) });
+    try {
+      items.push({ file: l.file, signed: l.tx as Signed, chainId: l.chainId, kind: relayKind(l.tx.cmd, expect), fee: Number(c.meta.gasLimit) * Number(c.meta.gasPrice) });
+    } catch (e: any) { die(`${l.file}: refused — ${e?.message ?? e}`); }
   }
 }
 // Two commands of the same kind for one chain means a stale file from an earlier run: sending both
@@ -115,40 +132,29 @@ for (const it of items) {
 const maxFee = items.reduce((s, i) => s + i.fee, 0);
 console.log(`  ✓ ${items.length} command(s) ${gasKey ? 'signed and ' : ''}verified locally — maximum fee ${maxFee.toFixed(6)} KDA in total`);
 
-async function onChain(it: Item): Promise<any> {
-  const d = { requestKey: it.signed.hash, chainId: it.chainId, networkId: NETWORK_ID };
-  return ((await retrying('status', () => client.getStatus(d))) as any)[it.signed.hash];
-}
 async function keysetIsOurs(chainId: ChainId): Promise<boolean> {
   if (!keyset) return false;
   const ks = await local(`(describe-keyset ${JSON.stringify(BACKFILL_KEYSET)})`, { chainId }).catch(() => null);
   return sameKeyset(ks, keyset);
 }
-async function preflight(it: Item, body: Emitted | Signed, verify: boolean): Promise<any> {
-  const r = await retrying('preflight', () => client.local(body as unknown as ICommand, { preflight: true, signatureVerification: verify }));
+async function preflight(it: Item): Promise<any> {
+  const { body, signatureVerification } = preflightRequest(it.signed, doSend);
+  const r = await retrying('preflight', () => client.local(body as unknown as ICommand, { preflight: true, signatureVerification }));
   if (r.result.status !== 'success') die(`${it.file}: the node's preflight refused it — ${errorText(r)}`);
   return r;
 }
 
-let ready = 0, skipped = 0, sent = 0;
+let ready = 0, sent = 0;
 for (const it of items) {
-  const prior = await onChain(it);
-  if (prior) {
-    if (prior.result?.status !== 'success') die(`${it.file} is already on chain and FAILED there — ${errorText(prior)}`);
-    console.log(`  · already on chain, skipped: ${it.file}`);
-    skipped++;
-    continue;
-  }
   if (it.kind === 'module' && !(await keysetIsOurs(it.chainId))) {
     die(`${it.file}: the backfill keyset on chain ${it.chainId} is not ours yet — send its keyset command first, then confirm with npm run preflight`);
   }
+  const pre = await preflight(it);
   if (!doSend) {
-    const pre = await preflight(it, unsignedBody(it.signed), false);
     console.log(`  ✓ preflight, unsigned  chain ${it.chainId.padStart(2)}  gas ${pre.gas}  ${it.file}`);
     ready++;
     continue;
   }
-  const pre = await preflight(it, it.signed, true);
   const desc = await retrying('submit', () => client.submit(it.signed as unknown as ICommand));
   if (desc.requestKey !== it.signed.hash) die(`${it.file}: the node returned request key ${desc.requestKey}, not the command's hash ${it.signed.hash}`);
   const r = await pollMined(desc.requestKey, it.chainId, it.file);

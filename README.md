@@ -238,19 +238,20 @@ never emitted or sent for a chain whose keyset is not already on chain with the 
 #    The decisive check runs the real module source on the target engine via /local.
 npm run preflight
 
-# 1. FIRST PASS: keyset commands only (one per chain, into ts/out/unsigned/)
+# 1. FIRST PASS: keyset commands only, one per chain, into ts/out/unsigned/<network-id>/
+#    (<network-id> is BH_NETWORK_ID, e.g. mainnet01)
 npm run deploy -- --unsigned
 
 # 2. Sign the gas payer's slot of every file, check it and preflight it on the node — nothing
 #    is sent — then send them one by one, and confirm they landed
-npm run send-signed -- --gas-key <gas-key.json> out/unsigned/*.json
-npm run send-signed -- --gas-key <gas-key.json> --send out/unsigned/*.json
+npm run send-signed -- --gas-key <gas-key.json> out/unsigned/<network-id>/*.json
+npm run send-signed -- --gas-key <gas-key.json> --send out/unsigned/<network-id>/*.json
 npm run preflight                     # keyset column must read "ours ✓" on every chain
 
 # 3. SECOND PASS: now the module commands are written; sign and send them the same way
 npm run deploy -- --unsigned
-npm run send-signed -- --gas-key <gas-key.json> out/unsigned/*.json
-npm run send-signed -- --gas-key <gas-key.json> --send out/unsigned/*.json
+npm run send-signed -- --gas-key <gas-key.json> out/unsigned/<network-id>/*.json
+npm run send-signed -- --gas-key <gas-key.json> --send out/unsigned/<network-id>/*.json
 
 # 4. Verify, then start capturing
 npm run preflight                     # module column shows the same hash everywhere
@@ -268,7 +269,7 @@ bytes match exactly and the chain would still accept it. Without `--send`, nothi
 node unsigned. With `--send`, the maximum fee is printed first, a module command goes only where the
 keyset is already ours, and each command is preflighted signed just before it is submitted. The key
 file must be readable by its owner alone; its secret is never printed; a re-run skips whatever is
-already on chain.
+already on chain before signing it, however old the file.
 The 2-of-3 backfill keyset is the keyset *content* — the authority that lasts, used for backfill
 and for `close-backfill`. At 500 rows per transaction a large backfill takes thousands of
 signatures, so scope it deliberately.
