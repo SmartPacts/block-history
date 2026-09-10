@@ -1,0 +1,95 @@
+name: ci
+
+# Every gate this repository relies on, on every push and pull request.
+# The workflow only reads the repository: it uses no secrets and has no write permission.
+# Third-party actions are pinned to full commit ids, not tags, so a moved tag cannot change them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The Pact binary is the KDA-CE build, pinned by release tag AND sha256.
+  PACT_TAG: 5.4ce
+  PACT_ASSET: pact-5.4ce-b769-ubuntu-24.04.tar.gz
+  PACT_SHA256: 7370d33fa1e69474921bdd853a56c608c9eee89f73fe0a4f2e7215a7ce065849
+  # The Node version the server setup script pins.
+  NODE_VERSION: 24.21.0
+
+jobs:
+  contract:
+    name: contract — static gate, suites, must-fail fixture, mutants
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Fetch Pact, verify its checksum
+        run: |
+          set -euo pipefail
+          curl -fsSL -o pact.tar.gz "https://github.com/kda-community/pact-5/releases/download/${PACT_TAG}/${PACT_ASSET}"
+          echo "${PACT_SHA256}  pact.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin" pact-extract
+          tar xzf pact.tar.gz -C pact-extract
+          install -m 0755 "$(find pact-extract -name pact -type f | head -1)" "$HOME/.local/bin/pact"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Pact is the expected version
+        run: |
+          set -euo pipefail
+          v=$(pact --version)
+          echo "$v"
+          grep -q '5\.4' <<<"$v"
+
+      - name: Full suite
+        run: pact/tests/run.sh
+
+  tools:
+    name: tools — typecheck, self-checks, shell scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install exactly the locked dependencies
+        working-directory: ts
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Typecheck and tool self-checks
+        working-directory: ts
+        run: |
+          set -euo pipefail
+          npm run typecheck
+          npm run test-tools
+
+      - name: Shell scripts — syntax and shellcheck
+        run: |
+          set -euo pipefail
+          command -v shellcheck >/dev/null || { echo "::error::shellcheck is not installed on this runner"; exit 1; }
+          mapfile -t scripts < <(git ls-files '*.sh')
+          [ "${#scripts[@]}" -gt 0 ] || { echo "::error::no shell scripts found"; exit 1; }
+          for s in "${scripts[@]}"; do bash -n "$s"; done
+          shellcheck "${scripts[@]}"
+          echo "checked ${#scripts[@]} scripts"
+
+  leak-scan:
+    name: nothing private is published
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Leak scan
+        run: .github/scripts/leak-scan.sh

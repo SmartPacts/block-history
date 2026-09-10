@@ -1,0 +1,27 @@
+;; frozen.repl-must-fail — the engine must REFUSE this file, and refuse it because the
+;; module is immutable. A load that succeeds means governance can be satisfied and the
+;; whole record can be rewritten. Asserted by run.sh: exit code non-zero AND the reason.
+;;
+;; The redefinition runs in its own transaction, after the deploy has committed, as any
+;; real upgrade would.
+(load "harness.repl")
+
+(env-chain-data { "chain-id": "2", "block-height": 1001, "prev-block-hash": "H1000"
+                , "block-time": (add-time (time "1970-01-01T00:00:00Z") 1000), "sender": "bot" })
+(begin-tx)
+(free.block-history.attest)
+(commit-tx)
+
+;; An "upgrade" that would let anyone rewrite history. Every key in the world signs.
+(env-data { "ns": "free" })
+(env-sigs [ { "key": "0000000000000000000000000000000000000000000000000000000000000bac", "caps": [] }
+          , { "key": "0000000000000000000000000000000000000000000000000000000000000ad0", "caps": [] } ])
+(begin-tx)
+(namespace "free")
+(module block-history GOVERNANCE
+  (defcap GOVERNANCE () true)
+  (defschema block hash:string time:time by:string)
+  (deftable attested:{block})
+  (defun rewrite (h:string k:string) (write attested k { "hash": h, "time": (time "1970-01-01T00:00:00Z"), "by": "mallory" })))
+(commit-tx)
+(print "MUST NEVER PRINT: the immutable module was upgraded")

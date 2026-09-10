@@ -1,0 +1,8 @@
+node_modules/
+ts/out/
+*.log
+*.pid
+*-key.json
+ts/.env
+devnet/certs/
+.pc-history

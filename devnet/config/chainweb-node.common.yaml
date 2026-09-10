@@ -1,0 +1,20 @@
+chainweb:
+  # recap-development: the devnet version this setup is tested with. It replays the fork
+  # ladder: 20 chains @60, Pact5 @640, full 3.1 @710.
+  chainwebVersion: recap-development
+  throttling:
+    global: 50
+    mempool: 20
+    putPeer: 11
+  serviceApi:
+    interface: '*'
+    port: 1848
+  p2p:
+    peer:
+      hostaddress:
+        port: 1789
+    ignoreBootstrapNodes: true
+    maxSessionCount: 2
+  mempoolP2p:
+    configuration:
+      maxSessionCount: 2

@@ -1,0 +1,15 @@
+# /etc/logrotate.d/block-history-feeder — keep the per-transaction log from filling the disk.
+# The feeder appends one JSON line per submitted attest: ~57,600 lines, ~11 MB, per day. The
+# smallest droplet has 10 GB, so unrotated it fills in about two years and then everything on the
+# box fails at once. Fourteen compressed days is ample for debugging; the chain is the record.
+# The feeder opens, appends and closes on every line, so a plain rename is safe — the next line
+# simply creates a fresh file at the original path.
+/var/log/block-history/feeder.jsonl {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 blockhistory blockhistory
+}

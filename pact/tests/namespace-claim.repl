@@ -1,0 +1,90 @@
+;; namespace-claim.repl — the keyset facts the DEPLOY CEREMONY depends on. Scored by EXIT CODE.
+;;
+;; This suite does not test the module. It pins the three engine behaviours that make the
+;; two-pass deploy necessary and sufficient: the README asserts them and `ts/src/deploy.ts` is
+;; built around them. If any of these changes, the ceremony is wrong and this file goes RED.
+;;
+;;   N1  Claiming an UNCLAIMED keyset name in an open namespace needs NO SIGNATURE.
+;;       -> first-come. Hence the keyset must be claimed and CONFIRMED on chain before the
+;;          immutable module is ever sent; otherwise a stranger claims it afterwards and owns
+;;          backfill on that chain forever.
+;;   N2  Rotating a CLAIMED name requires the current keyset; unsigned is refused.
+;;   N3  `keys-2` means exactly that: 1 of 3 refused, 2 of 3 accepted.
+;;       -> a 2-of-3 backfill keyset behaves as intended for backfill and close.
+;;
+;; The keys are placeholders: the REPL matches signers by key string.
+
+(env-data
+  { "ns-admin": { "keys": ["0000000000000000000000000000000000000000000000000000000000000ad0"], "pred": "keys-all" }
+  , "backfill3": { "keys": [ "1111111111111111111111111111111111111111111111111111111111111111"
+                           , "2222222222222222222222222222222222222222222222222222222222222222"
+                           , "3333333333333333333333333333333333333333333333333333333333333333" ]
+                 , "pred": "keys-2" }
+  , "attacker": { "keys": ["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"], "pred": "keys-all" } })
+
+(begin-tx)
+(module test-ns GOVERNANCE
+  (defcap GOVERNANCE () (enforce-guard (read-keyset "ns-admin")))
+  (defconst NS-GUARD (create-user-guard (succeed)))
+  (defun succeed () true))
+;; `free` on mainnet carries user-guard `ns.success` — anyone may define names in it.
+;; A permissive user guard reproduces that here.
+(define-namespace "free" test-ns.NS-GUARD test-ns.NS-GUARD)
+(commit-tx)
+
+(defconst KS "free.block-history-backfill")
+(defconst L1 "1111111111111111111111111111111111111111111111111111111111111111")
+(defconst L2 "2222222222222222222222222222222222222222222222222222222222222222")
+(defconst ATT "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+
+;; ---- N1: an unclaimed name is claimed with ZERO signatures ------------------------------
+;; The claim is the tx below committing at all under `env-sigs []`. It is then PROVEN to hold
+;; our keys by satisfying it with 2 of the 3 — enforcing it with zero signatures would fail for
+;; the unrelated reason that keys-2 needs two signatures.
+(env-sigs [])
+(begin-tx)
+(namespace "free")
+(define-keyset KS (read-keyset "backfill3"))
+(commit-tx)
+(env-sigs [ { "key": L1, "caps": [] }, { "key": L2, "caps": [] } ])
+(begin-tx)
+(expect "N1 an UNCLAIMED keyset name was claimed with NO signature, and holds the backfill keys — so the name is first-come and the deploy must claim it BEFORE sending the immutable module"
+  true (enforce-guard (keyset-ref-guard KS)))
+(rollback-tx)
+
+;; ---- N2: rotating a CLAIMED name requires the current keyset ----------------------------
+(env-sigs [])
+(begin-tx)
+(namespace "free")
+(expect-failure "N2 rotation with NO signature is refused" "Keyset failure"
+  (define-keyset KS (read-keyset "attacker")))
+(rollback-tx)
+
+;; ---- N3: keys-2 needs two of the three --------------------------------------------------
+(env-sigs [ { "key": L1, "caps": [] } ])
+(begin-tx)
+(namespace "free")
+(expect-failure "N3 rotation with only 1 of the 3 backfill keys is refused (keys-2)" "Keyset failure"
+  (define-keyset KS (read-keyset "attacker")))
+(rollback-tx)
+
+(env-sigs [ { "key": L1, "caps": [] }, { "key": L2, "caps": [] } ])
+(begin-tx)
+(namespace "free")
+(define-keyset KS (read-keyset "attacker"))
+(commit-tx)
+
+;; the rotation really happened: the old backfill keys no longer satisfy it, the new one does
+(env-sigs [ { "key": L1, "caps": [] }, { "key": L2, "caps": [] } ])
+(begin-tx)
+(expect-failure "N3b after rotation the OLD backfill keys no longer satisfy the keyset"
+  "Keyset failure" (enforce-guard (keyset-ref-guard KS)))
+(rollback-tx)
+(env-sigs [ { "key": ATT, "caps": [] } ])
+(begin-tx)
+(expect "N3c 2 of the 3 backfill keys DID rotate it — the 2-of-3 behaves as intended"
+  true (enforce-guard (keyset-ref-guard KS)))
+(rollback-tx)
+(env-sigs [])
+
+(print "namespace-claim.repl: OK")

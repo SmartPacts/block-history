@@ -1,0 +1,34 @@
+;; harness.repl — the world every suite loads: a namespace, the backfill keyset, the module.
+;;
+;; Block simulation. (env-chain-data …) MERGES into the previous public data, so a suite
+;; must always set height, prev-block-hash and block-time TOGETHER or it tests a chain
+;; state that cannot exist. Convention used by every suite:
+;;   height N   ->  prev-block-hash "H<N-1>"   block-time = EPOCH + (N-1) seconds
+;; i.e. the record of height h is {hash "H<h>", time EPOCH + h s}.
+;; Keys: 43-char hashes are only needed where `valid-hash` is on the path (backfill);
+;; attest stores whatever the engine hands it, so short test hashes are fine there.
+
+(env-data { "ns": "free"
+          , "backfill-ks": { "keys": ["0000000000000000000000000000000000000000000000000000000000000bac"], "pred": "keys-all" }
+          , "ns-admin":    { "keys": ["0000000000000000000000000000000000000000000000000000000000000ad0"], "pred": "keys-all" } })
+(begin-tx)
+(module test-ns GOVERNANCE
+  (defcap GOVERNANCE () (enforce-guard (read-keyset "ns-admin")))
+  (defconst NS-GUARD (create-user-guard (succeed)))
+  (defun succeed () true))
+(define-namespace "free" test-ns.NS-GUARD test-ns.NS-GUARD)
+(commit-tx)
+
+(begin-tx)
+(namespace "free")
+(define-keyset "free.block-history-backfill" (read-keyset "backfill-ks"))
+(commit-tx)
+
+;; Deployed at height 1000: the deploy transaction itself sees block 999 as previous.
+(env-chain-data { "chain-id": "2", "block-height": 1000, "prev-block-hash": "H999"
+                , "block-time": (add-time (time "1970-01-01T00:00:00Z") 999), "sender": "deployer" })
+(begin-tx)
+(load "../modules/block-history.pact")
+(commit-tx)
+(env-data {})
+(print "harness ready: free.block-history deployed at height 1000, backfill keyset ...0bac")

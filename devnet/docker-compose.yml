@@ -1,0 +1,122 @@
+name: block-history-devnet
+# block-history local devnet: one KDA-CE 3.2.1 node (recap-development), a constant-delay miner
+# (block time set in .env), and an nginx proxy that adds CORS on :8095 (HOST_SERVICE_PORT in .env).
+# Fresh genesis: docker compose down -v && docker compose up -d && ./warm.sh
+# The p2p certificate in ./certs comes from ./gen-certs.sh (never committed).
+configs:
+  cw-common:
+    file: ./config/chainweb-node.common.yaml
+  cw-logging:
+    file: ./config/chainweb-node.logging.yaml
+
+volumes:
+  block-history-devnet-db: {}
+
+services:
+
+  # --------------------------------------------------------------------------
+  # Single bootstrap node (minimal devnet) — serves the service API on :1848
+  # --------------------------------------------------------------------------
+  bootstrap-node:
+    image: ${CHAINWEB_NODE_IMAGE}
+    platform: linux/amd64
+    restart: unless-stopped
+    stop_grace_period: 20s
+    stop_signal: SIGINT
+    labels:
+      dev.block-history.devnet: "bootstrap"
+    ulimits:
+      nofile: { soft: 65535, hard: 65535 }
+    configs:
+      - source: cw-common
+        target: /chainweb/config/chainweb-node.common.yaml
+        mode: 0440
+      - source: cw-logging
+        target: /chainweb/config/chainweb-node.logging.yaml
+        mode: 0440
+    volumes:
+      - ./certs/devnet-bootstrap-node.cert.pem:/chainweb/devnet-bootstrap-node.cert.pem:ro
+      - ./certs/devnet-bootstrap-node.key.pem:/chainweb/devnet-bootstrap-node.key.pem:ro
+      - block-history-devnet-db:/chainweb/db
+    expose:
+      - "1848"
+      - "1789"
+    environment:
+      - DISABLE_POW_VALIDATION
+    entrypoint:
+      - /chainweb/chainweb-node
+      - +RTS
+      - -T
+
+      - -H400M
+      - -A64M
+      - -RTS
+      - --config-file=config/chainweb-node.common.yaml
+      - --config-file=config/chainweb-node.logging.yaml
+    command:
+      - --p2p-certificate-chain-file=/chainweb/devnet-bootstrap-node.cert.pem
+      - --p2p-certificate-key-file=/chainweb/devnet-bootstrap-node.key.pem
+      - --p2p-hostname=bootstrap-node
+      - --bootstrap-reachability=1
+      - --cluster-id=block-history-devnet
+      - --p2p-max-session-count=2
+      - --mempool-p2p-max-session-count=2
+      - --known-peer-info=${BOOTSTRAP_PEER_ID}@bootstrap-node:1789
+      - --log-level=info
+      - --enable-mining-coordination
+      - --mining-public-key=${MINER_PUBLIC_KEY}
+      - --header-stream
+      - --allowReadsInLocal
+      - --database-directory=/chainweb/db
+      - --disable-pow
+    healthcheck:
+      test:
+        - 'CMD'
+        - '/bin/bash'
+        - '-c'
+        - 'exec 3<>/dev/tcp/localhost/1848; printf "GET /health-check HTTP/1.1\r\nhost: http://localhost:1848\r\nConnection: close\r\n\r\n" >&3; grep -q "200 OK" <&3 || exit 1'
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 2m
+
+  # --------------------------------------------------------------------------
+  # Mining client — constant-delay blocks (CONSTANT_DELAY_BLOCK_TIME in .env)
+  # --------------------------------------------------------------------------
+  miner:
+    image: ${MINING_CLIENT_IMAGE}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      bootstrap-node:
+        condition: service_healthy
+    labels:
+      dev.block-history.devnet: "miner"
+    entrypoint: "/chainweb-mining-client/chainweb-mining-client"
+    command:
+      - --public-key=${MINER_PUBLIC_KEY}
+      - --node=bootstrap-node:1848
+      - --worker=constant-delay
+      - --thread-count=1
+      - --log-level=info
+      - --no-tls
+      - --constant-delay-block-time=${CONSTANT_DELAY_BLOCK_TIME:-10}
+
+  # --------------------------------------------------------------------------
+  # Nginx API proxy — publishes host :HOST_SERVICE_PORT (8095) -> container :80
+  # --------------------------------------------------------------------------
+  api-proxy:
+    restart: unless-stopped
+    image: amd64/nginx:latest
+    platform: linux/amd64
+    depends_on:
+      bootstrap-node:
+        condition: service_healthy
+    labels:
+      dev.block-history.devnet: "api-proxy"
+    volumes:
+      - ./config/nginx.cors.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - target: 80
+        published: ${HOST_SERVICE_PORT}
+        protocol: tcp

@@ -1,0 +1,78 @@
+;; vision-pin.repl — the tests that go RED if the vision is violated. Scored by EXIT CODE.
+;;
+;; The vision: an attested row is unforgeable and can never be confused with a
+;; backfilled one; a recorded hash can never be revised. Each pin below is proven
+;; load-bearing by run.sh, which builds three mutants of the module and requires this
+;; file to FAIL against every one of them:
+;;   mutant-fallback     get-attested silently falls back to the backfilled table
+;;   mutant-shadow       backfill no longer refuses an already-attested height
+;;   mutant-rewrite      attest overwrites instead of refusing a second recording
+;; A module path may be passed via env-data "module" so the mutants load in place.
+(env-data { "ns": "free"
+          , "backfill-ks": { "keys": ["0000000000000000000000000000000000000000000000000000000000000bac"], "pred": "keys-all" }
+          , "ns-admin":    { "keys": ["0000000000000000000000000000000000000000000000000000000000000ad0"], "pred": "keys-all" } })
+(begin-tx)
+(module test-ns GOVERNANCE
+  (defcap GOVERNANCE () (enforce-guard (read-keyset "ns-admin")))
+  (defconst NS-GUARD (create-user-guard (succeed)))
+  (defun succeed () true))
+(define-namespace "free" test-ns.NS-GUARD test-ns.NS-GUARD)
+(namespace "free")
+(define-keyset "free.block-history-backfill" (read-keyset "backfill-ks"))
+(commit-tx)
+(env-chain-data { "chain-id": "2", "block-height": 1000, "prev-block-hash": "H999"
+                , "block-time": (add-time (time "1970-01-01T00:00:00Z") 999), "sender": "deployer" })
+(begin-tx)
+(load "../modules/block-history.pact")
+(commit-tx)
+(env-data {})
+(defconst EPOCH (time "1970-01-01T00:00:00Z"))
+(defconst H43 "QqNvtjXzPCn8J1UD_MicQvSQs8ogzAIGfAIe9boWC9s")
+
+;; ---- VISION-1: a backfilled row is NEVER served as attested -------------------
+(env-sigs [ { "key": "0000000000000000000000000000000000000000000000000000000000000bac", "caps": [ (free.block-history.BACKFILL) ] } ])
+(env-data { "rows": [ { "height": 500, "hash": H43, "time": { "time": "1970-01-01T00:08:20Z" } } ] })
+(begin-tx)
+(free.block-history.backfill (read-msg 'rows))
+(commit-tx)
+(env-sigs [])
+(begin-tx)
+(expect "VISION-1 the row exists as backfilled" true (free.block-history.has-backfilled 500))
+(expect-failure "VISION-1a get-attested refuses a backfilled height" "No value found in table free.block-history_attested"
+  (free.block-history.get-attested 500))
+(expect-failure "VISION-1b hash-of refuses a backfilled height" "No value found in table free.block-history_attested"
+  (free.block-history.hash-of 500))
+(expect "VISION-1c get-block says so out loud" "backfilled" (at 'source (free.block-history.get-block 500)))
+(commit-tx)
+
+;; ---- VISION-2: an attested height can never be shadowed by a backfill ----------
+(env-chain-data { "chain-id": "2", "block-height": 1001, "prev-block-hash": "H1000"
+                , "block-time": (add-time EPOCH 1000), "sender": "bot" })
+(begin-tx)
+(free.block-history.attest)
+(commit-tx)
+(env-chain-data { "chain-id": "2", "block-height": 1010, "prev-block-hash": "H1009"
+                , "block-time": (add-time EPOCH 1009), "sender": "op" })
+(env-sigs [ { "key": "0000000000000000000000000000000000000000000000000000000000000bac", "caps": [ (free.block-history.BACKFILL) ] } ])
+(env-data { "rows": [ { "height": 1000, "hash": H43, "time": { "time": "1970-01-01T00:16:40Z" } } ] })
+(begin-tx)
+(expect-failure "VISION-2 the operator cannot write over an attested height" "block-history: backfill: height is already attested"
+  (free.block-history.backfill (read-msg 'rows)))
+(rollback-tx)
+(env-sigs [])
+(env-data {})
+(expect "VISION-2a the engine's value stands" "H1000" (free.block-history.hash-of 1000))
+(expect "VISION-2b and it is not ALSO backfilled" false (free.block-history.has-backfilled 1000))
+
+;; ---- VISION-3: a recorded hash is final — a later block cannot revise it ----------
+;; The engine could never hand a different prev-block-hash for the same height on one
+;; fork; this simulates a module that lets it through. The first value must stand.
+(env-chain-data { "chain-id": "2", "block-height": 1001, "prev-block-hash": "FORGED-1000"
+                , "block-time": (add-time EPOCH 1000), "sender": "mallory" })
+(begin-tx)
+(expect "VISION-3 a second recording of the same height is a no-op" "already recorded" (free.block-history.attest))
+(commit-tx)
+(expect "VISION-3a the first value stands" "H1000" (free.block-history.hash-of 1000))
+(expect "VISION-3b the first recorder stands" "bot" (at 'by (free.block-history.get-attested 1000)))
+
+(print "vision-pin.repl: OK")

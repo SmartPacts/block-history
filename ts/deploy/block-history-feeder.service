@@ -1,0 +1,52 @@
+# /etc/systemd/system/block-history-feeder.service — the block-history feeder: one process, all chains.
+#
+# Installed by ts/deploy/provision-droplet.sh, which never enables it. ENABLING IT STARTS SENDING
+# MAINNET TRANSACTIONS, so that step belongs to the operator, after the module is deployed:
+#   systemctl enable --now block-history-feeder
+#   journalctl -u block-history-feeder -f
+#
+# Started too early it is harmless: before the module exists on chain the feeder fails its own
+# startup check on the first chain and exits without opening the stream or sending anything.
+
+[Unit]
+Description=block-history feeder (attests every block on every chain)
+After=network-online.target
+Wants=network-online.target
+# A persistent misconfiguration (an unfunded chain, the module not yet deployed) makes the feeder
+# exit at startup. Without a limit systemd would restart it forever and hammer the public node with
+# reads. Five failed starts in 30 minutes stops it until someone looks.
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=blockhistory
+Group=blockhistory
+WorkingDirectory=/opt/block-history/ts
+Environment=NODE_ENV=production
+Environment=BH_LOG_FILE=/var/log/block-history/feeder.jsonl
+# node directly, not `npm run`: npm is a second ~50 MB process on a small box, and one more layer
+# between systemd and the process it is meant to supervise. Measured peak RSS: 204 MB.
+ExecStart=/usr/local/bin/node --import tsx src/feeder.ts
+Restart=always
+RestartSec=30
+# A leak must not take the whole machine down with it: past this systemd kills and restarts it.
+MemoryMax=450M
+
+# The feeder holds a hot key with a small gas balance. Unprivileged user; the whole file system is
+# read-only to it except its own log. It never needs to write its key, so it cannot alter it.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/block-history
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Deliberately NOT set: MemoryDenyWriteExecute, which breaks V8's JIT.
+
+[Install]
+WantedBy=multi-user.target
