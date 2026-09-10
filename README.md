@@ -241,13 +241,16 @@ npm run preflight
 # 1. FIRST PASS: keyset commands only (one per chain, into ts/out/unsigned/)
 npm run deploy -- --unsigned
 
-# 2. Sign and send every keyset file, then confirm they landed
-npm run send-signed -- ts/out/unsigned/<each keyset file>
+# 2. Sign the gas payer's slot of every file, check it and preflight it on the node — nothing
+#    is sent — then send them one by one, and confirm they landed
+npm run send-signed -- --gas-key <gas-key.json> out/unsigned/*.json
+npm run send-signed -- --gas-key <gas-key.json> --send out/unsigned/*.json
 npm run preflight                     # keyset column must read "ours ✓" on every chain
 
-# 3. SECOND PASS: now the module commands are written
+# 3. SECOND PASS: now the module commands are written; sign and send them the same way
 npm run deploy -- --unsigned
-npm run send-signed -- ts/out/unsigned/<each module file>
+npm run send-signed -- --gas-key <gas-key.json> out/unsigned/*.json
+npm run send-signed -- --gas-key <gas-key.json> --send out/unsigned/*.json
 
 # 4. Verify, then start capturing
 npm run preflight                     # module column shows the same hash everywhere
@@ -257,7 +260,12 @@ npm run oracle -- --last 600          # must print CONSISTENT
 ```
 
 **Signing.** Deploying needs only **gas**: neither the keyset definition nor the module deploy
-requires a keyset signature, because claiming an unclaimed name in `free` is unauthenticated.
+requires a keyset signature, because claiming an unclaimed name in `free` is unauthenticated. So each
+file carries one signer, the gas payer, scoped to `coin.GAS`. `send-signed --gas-key` signs only the
+deploy's own two commands — the backfill keyset definition carrying `BH_BACKFILL_KEYSET`, and the exact
+module source — at `BH_GAS_PRICE` and within the deploy's gas limits; any other or altered file is
+refused before it is signed. The key file's secret is never printed, and a re-run skips whatever is
+already on chain.
 The 2-of-3 backfill keyset is the keyset *content* — the authority that lasts, used for backfill
 and for `close-backfill`. At 500 rows per transaction a large backfill takes thousands of
 signatures, so scope it deliberately.

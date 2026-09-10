@@ -6,7 +6,9 @@ import {
   Pact, createClient, createSignWithKeypair,
   type ChainId, type ICommand, type ICommandResult, type IUnsignedCommand,
 } from '@kadena/client';
-import { genKeyPair } from '@kadena/cryptography-utils';
+import {
+  genKeyPair, hash as blakeHash, signHash, verifySig, restoreKeyPairFromSecretKey, hexToBin, base64UrlDecodeArr,
+} from '@kadena/cryptography-utils';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -100,7 +102,7 @@ export function unwrap(v: any): any {
   return v;
 }
 
-async function retrying<T>(what: string, fn: () => Promise<T>, attempts = 6): Promise<T> {
+export async function retrying<T>(what: string, fn: () => Promise<T>, attempts = 6): Promise<T> {
   let last: any;
   for (let i = 1; i <= attempts; i++) {
     try { return await fn(); }
@@ -196,6 +198,94 @@ export async function sendExpectFail(s: TxSpec, mustContain: string): Promise<st
   if (!msg.includes(mustContain)) throw new Error(`${s.label}: expected "${mustContain}", got: ${msg.slice(0, 400)}`);
   console.log(`  ✓ refused as expected: ${s.label} — "${mustContain}"`);
   return msg;
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// The deploy's two commands, built in ONE place so the gas-key signer can recognise them exactly.
+// The gas payer's signature is scoped to coin.GAS: neither command needs it for anything else
+// (claiming an unclaimed name in `free`, and a module's first deploy, are unauthenticated), so a
+// signature on them can pay gas and nothing more.
+export const KEYSET_GAS_LIMIT = 2000;
+export const MODULE_GAS_LIMIT = 120000;
+export const keysetDeployCode = (ns: string) =>
+  `(namespace ${JSON.stringify(ns)}) (define-keyset ${JSON.stringify(`${ns}.block-history-backfill`)} (read-keyset "ks"))`;
+export const sameKeyset = (a: any, b: { keys: string[]; pred: string }) =>
+  !!a && a.pred === b.pred && Array.isArray(a.keys) && a.keys.length === b.keys.length
+  && [...a.keys].sort().join() === [...b.keys].sort().join();
+
+export type Emitted = { cmd: string; hash: string; sigs: ({ pubKey?: string; sig?: string } | null)[] };
+export type Signed = { cmd: string; hash: string; sigs: { sig: string }[] };
+
+export function buildUnsignedGasOnly(s: {
+  code: string; data: Record<string, any>; chainId: ChainId; sender: string; signerPubKey: string;
+  gasLimit: number; creationTime: number; gasPrice?: number; networkId?: string;
+}): Emitted {
+  let b: any = Pact.builder.execution(s.code).addSigner(s.signerPubKey, (wc: WithCap) => [wc('coin.GAS')]);
+  for (const [k, v] of Object.entries(s.data)) b = b.addData(k, v);
+  const tx: IUnsignedCommand = b
+    .setMeta({ chainId: s.chainId, senderAccount: s.sender, gasLimit: s.gasLimit, gasPrice: s.gasPrice ?? GAS_PRICE, ttl: 28800, creationTime: s.creationTime })
+    .setNetworkId(s.networkId ?? NETWORK_ID)
+    .createTransaction();
+  return { cmd: tx.cmd, hash: tx.hash, sigs: [{ pubKey: s.signerPubKey }] };
+}
+
+export type DeployExpect = { networkId: string; ns: string; source: string; keyset: { keys: string[]; pred: string } | null; gasPrice: number };
+
+// Signs the gas payer's slot of ONE emitted deploy command, or throws naming the guard that refused.
+// Pure — no network, nothing printed. Every check runs BEFORE anything is signed.
+export function signGasSlot(tx: Emitted, gasKey: { secretKey: string; publicKey?: string }, x: DeployExpect): Signed {
+  if (typeof gasKey.secretKey !== 'string' || !/^[0-9a-f]{64}$/.test(gasKey.secretKey)) throw new Error('key file: secretKey must be 64 hex characters');
+  const pub = restoreKeyPairFromSecretKey(gasKey.secretKey).publicKey;
+  if (gasKey.publicKey !== undefined && gasKey.publicKey !== pub) throw new Error('key file: its publicKey does not belong to its secretKey');
+  let cmd: any;
+  try { cmd = JSON.parse(tx.cmd); } catch { throw new Error('format: the command is not JSON'); }
+  // Exactly the bytes the deploy tool writes (JSON.stringify of the command). A duplicated key or odd
+  // encoding could make this parser and the node's read different commands from the same text.
+  if (JSON.stringify(cmd) !== tx.cmd) throw new Error('format: the command is not in the exact form the deploy tool writes');
+  if (cmd.networkId !== x.networkId) throw new Error(`network: the command is for ${cmd.networkId}, this run targets ${x.networkId}`);
+  if (blakeHash(tx.cmd) !== tx.hash) throw new Error('hash: the file hash does not match its command');
+  if (cmd.meta?.sender !== `k:${pub}`) throw new Error(`sender: the command's gas payer is ${cmd.meta?.sender}, not this key's account k:${pub}`);
+  const signers = Array.isArray(cmd.signers) ? cmd.signers : [];
+  if (signers.length !== 1 || signers[0].pubKey !== pub) throw new Error('signers: the command must have exactly one signer, this key');
+  const clist = Array.isArray(signers[0].clist) ? signers[0].clist : [];
+  if (clist.length !== 1 || clist[0].name !== 'coin.GAS' || (clist[0].args ?? []).length !== 0) throw new Error('scope: the signature must be scoped to coin.GAS alone');
+  if (Number(cmd.meta.gasPrice) !== x.gasPrice) throw new Error(`gas price: ${cmd.meta.gasPrice}, expected ${x.gasPrice}`);
+  const code = cmd.payload?.exec?.code;
+  const data = cmd.payload?.exec?.data ?? {};
+  const fields = Object.keys(data).sort().join(',');
+  let limit: number;
+  if (code === keysetDeployCode(x.ns)) {
+    if (fields !== 'ks' || !x.keyset || !sameKeyset(data.ks, x.keyset)) throw new Error('content: the keyset in this command is not the configured backfill keyset (BH_BACKFILL_KEYSET)');
+    limit = KEYSET_GAS_LIMIT;
+  } else if (code === x.source) {
+    if (fields !== 'ns' || data.ns !== x.ns) throw new Error(`content: the module command's data must be exactly {"ns": "${x.ns}"}`);
+    limit = MODULE_GAS_LIMIT;
+  } else {
+    throw new Error('content: neither the backfill keyset definition nor the exact module source — refusing to sign');
+  }
+  if (Number(cmd.meta.gasLimit) > limit) throw new Error(`gas limit: ${cmd.meta.gasLimit} is above ${limit} for this command`);
+  const sig = signHash(tx.hash, { publicKey: pub, secretKey: gasKey.secretKey }).sig;
+  if (!sig || !verifySig(base64UrlDecodeArr(tx.hash), hexToBin(sig), hexToBin(pub))) throw new Error('signature: it did not verify');
+  return { cmd: tx.cmd, hash: tx.hash, sigs: [{ sig }] };
+}
+
+// For commands signed elsewhere: every signer slot is filled and verifies against the command's
+// hash. Returns the reason it cannot be sent, or null.
+export function verifySigned(tx: Emitted, networkId: string): string | null {
+  let cmd: any;
+  try { cmd = JSON.parse(tx.cmd); } catch { return 'format: the command is not JSON'; }
+  if (cmd.networkId !== networkId) return `network: the command is for ${cmd.networkId}, this run targets ${networkId}`;
+  if (blakeHash(tx.cmd) !== tx.hash) return 'hash: the file hash does not match its command';
+  const signers = Array.isArray(cmd.signers) ? cmd.signers : [];
+  if (!Array.isArray(tx.sigs) || tx.sigs.length !== signers.length) return `signatures: expected ${signers.length}, found ${Array.isArray(tx.sigs) ? tx.sigs.length : 0}`;
+  for (let i = 0; i < signers.length; i++) {
+    const sig = tx.sigs[i]?.sig;
+    if (!sig) return `signatures: signer ${i + 1} of ${signers.length} has not signed`;
+    if (!/^[0-9a-f]{128}$/.test(sig) || !verifySig(base64UrlDecodeArr(tx.hash), hexToBin(sig), hexToBin(signers[i].pubKey)))
+      return `signatures: signer ${i + 1} of ${signers.length} does not verify`;
+  }
+  return null;
 }
 
 export async function balance(account: string, chainId: ChainId): Promise<number> {

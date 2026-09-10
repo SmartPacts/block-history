@@ -1,6 +1,6 @@
 // deploy.ts — put block-history on every configured chain.
 //   npm run deploy                 deploy (devnet: creates + funds the admin, feeder and backfill keys)
-//   npm run deploy -- --unsigned   write each command as a file for wallet signing instead of sending
+//   npm run deploy -- --unsigned   write each command as a file instead of sending; sign + send with send-signed
 //
 // Per chain, in order: (1) the backfill keyset `${NS}.block-history-backfill` is defined if absent
 // (and REFUSED if present with other keys — a stranger could otherwise own backfill in an open
@@ -17,10 +17,10 @@
 import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChainId } from '@kadena/client';
-import { Pact } from '@kadena/client';
 import {
-  API, NETWORK_ID, NS, MODULE, BACKFILL_KEYSET, GAS_PRICE, OUT, ROOT, SENDER00, isDevnet, keyPath,
+  API, NETWORK_ID, NS, MODULE, BACKFILL_KEYSET, OUT, ROOT, SENDER00, isDevnet, keyPath,
   loadOrCreateKey, accountOf, keysetOf, parseChains, local, send, balance, chainTime, type TxSpec, type Keypair,
+  sameKeyset, keysetDeployCode, buildUnsignedGasOnly, KEYSET_GAS_LIMIT, MODULE_GAS_LIMIT,
 } from './lib.js';
 
 const UNSIGNED = process.argv.includes('--unsigned');
@@ -37,6 +37,9 @@ let _admin: Keypair | null = null, _feeder: Keypair | null = null, _backfill: Ke
 const adminKey = (): Keypair => (_admin ??= loadOrCreateKey(keyPath('BH_ADMIN_KEY', 'out/admin-key.json')));
 const feederKey = (): Keypair => (_feeder ??= loadOrCreateKey(keyPath('BH_FEEDER_KEY', 'out/feeder-key.json')));
 const backfillKey = (): Keypair => (_backfill ??= loadOrCreateKey(keyPath('BH_BACKFILL_KEY', 'out/backfill-key.json')));
+// In unsigned mode a command carries no local signer: the file names the gas payer (adminPubKey) and
+// no key file is opened. A public-network checkout has none, so opening one would stop the deploy.
+const adminSigners = () => (UNSIGNED ? [] : [{ kp: adminKey() }]);
 
 const ENV_ACCT = process.env.BH_ADMIN_ACCOUNT;
 const adminAcct = ENV_ACCT ?? accountOf(adminKey());
@@ -60,23 +63,22 @@ const backfillKeyset = (() => {
   }
   return ks as { keys: string[]; pred: string };
 })();
-const sameKeyset = (a: any, b: { keys: string[]; pred: string }) =>
-  !!a && a.pred === b.pred && a.keys.length === b.keys.length && [...a.keys].sort().join() === [...b.keys].sort().join();
 
 let seq = 0;
-async function writeUnsigned(s: TxSpec, signerKeys: string[]): Promise<void> {
+// The gas payer is the only signer, scoped to coin.GAS (lib.ts: buildUnsignedGasOnly). Sign and send
+// the files with `npm run send-signed -- --gas-key <key.json> …`, which accepts nothing else.
+async function writeUnsigned(s: TxSpec, signerKey: string): Promise<void> {
   const now = await chainTime(s.chainId);
-  let b: any = Pact.builder.execution(s.code);
-  for (const k of signerKeys) b = b.addSigner(k);
-  for (const [k, v] of Object.entries(s.data ?? {})) b = b.addData(k, v);
-  const tx = b.setMeta({ chainId: s.chainId, senderAccount: s.sender, gasLimit: s.gasLimit ?? 150000, gasPrice: s.gasPrice ?? GAS_PRICE, ttl: 28800, creationTime: Math.floor(now.getTime() / 1000) - 15 })
-    .setNetworkId(NETWORK_ID).createTransaction();
+  const tx = buildUnsignedGasOnly({
+    code: s.code, data: s.data ?? {}, chainId: s.chainId, sender: s.sender, signerPubKey: signerKey,
+    gasLimit: s.gasLimit ?? MODULE_GAS_LIMIT, gasPrice: s.gasPrice, creationTime: Math.floor(now.getTime() / 1000) - 15,
+  });
   mkdirSync(join(OUT, 'unsigned'), { recursive: true });
   const p = join(OUT, 'unsigned', `${String(++seq).padStart(2, '0')}-chain${s.chainId}-${s.label.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`);
-  writeFileSync(p, JSON.stringify({ cmd: tx.cmd, hash: tx.hash, sigs: signerKeys.map((k) => ({ pubKey: k })) }, null, 2) + '\n');
+  writeFileSync(p, JSON.stringify(tx, null, 2) + '\n');
   console.log(`  ✎ chain ${s.chainId}: ${s.label} → ${p}`);
 }
-const step = (s: TxSpec) => (UNSIGNED ? writeUnsigned({ ...s, sender: adminAcct }, [adminPubKey]) : send(s));
+const step = (s: TxSpec) => (UNSIGNED ? writeUnsigned({ ...s, sender: adminAcct }, adminPubKey) : send(s));
 
 async function fundOnDevnet(c: ChainId, kp: Keypair, amount: number, what: string) {
   const acct = accountOf(kp);
@@ -114,9 +116,8 @@ async function deployChain(c: ChainId): Promise<{ chain: ChainId; hash: string; 
   if (existingKs && !sameKeyset(existingKs, backfillKeyset)) throw new Error(`chain ${c}: ${BACKFILL_KEYSET} exists with OTHER keys ${JSON.stringify(existingKs.keys)} (${existingKs.pred}) — not ours; refusing (this chain is lost: the module is immutable and cannot be pointed at another keyset)`);
   if (!existingKs) {
     await step({
-      label: `define keyset ${BACKFILL_KEYSET}`, chainId: c, sender: adminAcct, gasLimit: 2000,
-      code: `(namespace ${JSON.stringify(NS)}) (define-keyset ${JSON.stringify(BACKFILL_KEYSET)} (read-keyset "ks"))`,
-      signers: [{ kp: adminKey() }], data: { ks: backfillKeyset },
+      label: `define keyset ${BACKFILL_KEYSET}`, chainId: c, sender: adminAcct, gasLimit: KEYSET_GAS_LIMIT,
+      code: keysetDeployCode(NS), signers: adminSigners(), data: { ks: backfillKeyset },
     });
     if (UNSIGNED) return { chain: c, hash: '(none yet)', status: 'KEYSET command written — sign and send it, then re-run for the module' };
     const confirmed = await local(`(describe-keyset ${JSON.stringify(BACKFILL_KEYSET)})`, { chainId: c }).catch(() => null);
@@ -127,10 +128,10 @@ async function deployChain(c: ChainId): Promise<{ chain: ChainId; hash: string; 
   const existing = await local(`(describe-module ${JSON.stringify(MODULE)})`, { chainId: c }).catch(() => null);
   if (existing) return { chain: c, hash: existing.hash, status: 'already deployed (immutable) — untouched' };
   if (UNSIGNED) {
-    await step({ label: `deploy ${MODULE}`, chainId: c, sender: adminAcct, gasLimit: 120000, code: SOURCE, signers: [{ kp: adminKey() }], data: { ns: NS } });
+    await step({ label: `deploy ${MODULE}`, chainId: c, sender: adminAcct, gasLimit: MODULE_GAS_LIMIT, code: SOURCE, signers: adminSigners(), data: { ns: NS } });
     return { chain: c, hash: '(unsigned)', status: 'MODULE command written (keyset already confirmed on chain)' };
   }
-  const landed = await send({ label: `deploy ${MODULE}`, chainId: c, sender: adminAcct, gasLimit: 120000, code: SOURCE, signers: [{ kp: adminKey() }], data: { ns: NS } });
+  const landed = await send({ label: `deploy ${MODULE}`, chainId: c, sender: adminAcct, gasLimit: MODULE_GAS_LIMIT, code: SOURCE, signers: [{ kp: adminKey() }], data: { ns: NS } });
 
   // 3. verify
   const mod = await local(`(describe-module ${JSON.stringify(MODULE)})`, { chainId: c });
@@ -145,7 +146,7 @@ async function main() {
   console.log(`\n=== block-history deploy → ${API}  ns=${NS}  chains=${CHAINS.join(',')}${UNSIGNED ? '  (UNSIGNED: files for wallet signing)' : ''} ===`);
   console.log(`  admin    ${adminAcct} (signer ${adminPubKey.slice(0, 12)}…)\n  feeder   ${UNSIGNED ? '(not needed in unsigned mode)' : accountOf(feederKey())}\n  backfill keyset ${BACKFILL_KEYSET} = ${backfillKeyset.keys.length} key(s), ${backfillKeyset.pred}`);
   if (!isDevnet() && UNSIGNED === false) {
-    throw new Error(`refusing to sign and send on ${NETWORK_ID} from this machine: use --unsigned and sign in your wallet`);
+    throw new Error(`refusing to sign and send on ${NETWORK_ID} directly: use --unsigned, then npm run send-signed -- --gas-key <key.json>`);
   }
   const results: { chain: ChainId; hash: string; status: string }[] = [];
   // a few chains at a time: independent mempools, one node
@@ -160,7 +161,7 @@ async function main() {
   const pending = results.filter((r) => r.status.startsWith('KEYSET command written'));
   if (pending.length) {
     console.log(`\n  ${pending.length} chain(s) need their KEYSET sent first: ${pending.map((r) => r.chain).join(',')}`);
-    console.log(`  Sign and send every keyset file in ts/out/unsigned/, confirm with 'npm run preflight', then re-run this command for the module files.`);
+    console.log(`  Sign and send them (npm run send-signed -- --gas-key <key.json> [--send] out/unsigned/*.json), confirm with 'npm run preflight', then re-run this command for the module files.`);
   }
   const hashes = new Set(results.filter((r) => !r.status.startsWith('KEYSET')).map((r) => r.hash));
   if (!UNSIGNED && hashes.size !== 1) throw new Error(`module hash differs across chains: ${[...hashes].join(' ')} — the same source in the same namespace must hash identically`);

@@ -13,7 +13,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChainId } from '@kadena/client';
-import { API, NETWORK_ID, NS, MODULE, BACKFILL_KEYSET, ROOT, parseChains, local, balance } from './lib.js';
+import { API, NETWORK_ID, NS, MODULE, BACKFILL_KEYSET, ROOT, parseChains, local, balance, sameKeyset } from './lib.js';
 
 const args = process.argv.slice(2);
 const opt = (n: string, d?: string) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : d; };
@@ -25,8 +25,6 @@ const WANT_KS: { keys: string[]; pred: string } | null = process.env.BH_BACKFILL
 // Deploy 10,824 + keyset 2,000 gas at the 1e-8 floor, plus headroom for the feeder to start.
 const MIN_KDA = Number(process.env.BH_MIN_KDA ?? '0.02');
 
-const sameKeyset = (a: any, b: { keys: string[]; pred: string }) =>
-  !!a && a.pred === b.pred && a.keys.length === b.keys.length && [...a.keys].sort().join() === [...b.keys].sort().join();
 
 type Row = { chain: ChainId; ns: string; mod: string; ks: string; gas: string; dry: string; hash: string; verdict: 'GO' | 'NOT READY' | 'LOST' };
 
