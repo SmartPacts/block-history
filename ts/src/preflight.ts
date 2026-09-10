@@ -13,7 +13,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChainId } from '@kadena/client';
-import { API, NETWORK_ID, NS, MODULE, BACKFILL_KEYSET, ROOT, parseChains, local, balance, sameKeyset } from './lib.js';
+import { API, NETWORK_ID, NS, MODULE, BACKFILL_KEYSET, ROOT, parseChains, local, balance, sameKeyset, validateKeyset } from './lib.js';
 
 const args = process.argv.slice(2);
 const opt = (n: string, d?: string) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : d; };
@@ -21,7 +21,7 @@ const CHAINS = parseChains(opt('chains', process.env.BH_CHAINS ?? '0-19'));
 const SOURCE = readFileSync(join(ROOT, 'pact', 'modules', 'block-history.pact'), 'utf8');
 const GAS_ACCOUNT = process.env.BH_ADMIN_ACCOUNT ?? '';
 // The keyset the deploy WILL define. On mainnet this is the 2-of-3 backfill keyset.
-const WANT_KS: { keys: string[]; pred: string } | null = process.env.BH_BACKFILL_KEYSET ? JSON.parse(process.env.BH_BACKFILL_KEYSET) : null;
+const WANT_KS: { keys: string[]; pred: string } | null = process.env.BH_BACKFILL_KEYSET ? validateKeyset(JSON.parse(process.env.BH_BACKFILL_KEYSET)) : null;
 // Deploy 10,824 + keyset 2,000 gas at the 1e-8 floor, plus headroom for the feeder to start.
 const MIN_KDA = Number(process.env.BH_MIN_KDA ?? '0.02');
 

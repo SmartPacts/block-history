@@ -261,10 +261,13 @@ npm run oracle -- --last 600          # must print CONSISTENT
 
 **Signing.** Deploying needs only **gas**: neither the keyset definition nor the module deploy
 requires a keyset signature, because claiming an unclaimed name in `free` is unauthenticated. So each
-file carries one signer, the gas payer, scoped to `coin.GAS`. `send-signed --gas-key` signs only the
-deploy's own two commands — the backfill keyset definition carrying `BH_BACKFILL_KEYSET`, and the exact
-module source — at `BH_GAS_PRICE` and within the deploy's gas limits; any other or altered file is
-refused before it is signed. The key file's secret is never printed, and a re-run skips whatever is
+file carries one signer, the gas payer, scoped to `coin.GAS`. `send-signed --gas-key` rebuilds each file
+from what it must contain — the backfill keyset definition carrying `BH_BACKFILL_KEYSET`, or the exact
+module source — at `BH_GAS_PRICE` (at most 1e-7) and the deploy's gas limits, and signs it only if the
+bytes match exactly. Without `--send`, nothing signed leaves the machine: each command is checked on the
+node unsigned. With `--send`, the maximum fee is printed first, a module command goes only where the
+keyset is already ours, and each command is preflighted signed just before it is submitted. The key
+file must be readable by its owner alone; its secret is never printed; a re-run skips whatever is
 already on chain.
 The 2-of-3 backfill keyset is the keyset *content* — the authority that lasts, used for backfill
 and for `close-backfill`. At 500 rows per transaction a large backfill takes thousands of

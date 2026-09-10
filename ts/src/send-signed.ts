@@ -1,22 +1,25 @@
 // send-signed.ts — sign the gas payer's slot of the commands `deploy --unsigned` wrote, check every
-// one, preflight every one on the node, and only with --send submit them, one at a time, in order.
-//   npm run send-signed -- --gas-key <key.json> out/unsigned/*.json          check only — nothing is sent
-//   npm run send-signed -- --gas-key <key.json> --send out/unsigned/*.json   sign, check, then submit
+// one, and only with --send submit them, one at a time.
+//   npm run send-signed -- --gas-key <key.json> out/unsigned/*.json          check only
+//   npm run send-signed -- --gas-key <key.json> --send out/unsigned/*.json   sign, check, submit
 //   npm run send-signed -- [--send] <signed.json> …                           commands already signed elsewhere
 //
-// The key file is JSON {publicKey, secretKey}. Its secret stays inside this process and is never printed.
-// With --gas-key the tool signs ONLY the deploy's own two commands — the backfill keyset definition
-// carrying BH_BACKFILL_KEYSET, and the exact module source with {"ns": BH_NS} — at BH_GAS_PRICE, within
-// the deploy's gas limits, with one signature scoped to coin.GAS. Anything else, including any file
-// changed after it was written, is refused before a signature exists (lib.ts: signGasSlot).
-// Every command is preflighted before the first one is sent, and a command already on chain is
-// reported and skipped, so re-running after a partial session is safe.
+// The key file is JSON {publicKey, secretKey}, readable by its owner alone (required for --send). Its
+// secret stays inside this process and is never printed, and no argument may carry anything that looks
+// like one. With --gas-key a file is signed only if it is byte for byte one of the deploy's own two
+// commands (lib.ts: signGasSlot): the backfill keyset definition carrying BH_BACKFILL_KEYSET, or the
+// exact module source with {"ns": BH_NS}, at BH_GAS_PRICE and the deploy's gas limits, with one
+// signature scoped to coin.GAS.
+// CHECK ONLY (no --send): nothing signed leaves this machine — each command is preflighted on the node
+// in its unsigned form. SEND: the maximum fee is printed first; a module command is sent only on a
+// chain whose backfill keyset is already ours; each command is preflighted, signed, immediately before
+// it is submitted; a command already on chain is skipped, so re-running after a partial session is safe.
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChainId, ICommand } from '@kadena/client';
 import {
-  API, NETWORK_ID, NS, ROOT, GAS_PRICE, client, retrying, pollMined, errorText,
-  signGasSlot, verifySigned, type Emitted, type Signed,
+  API, NETWORK_ID, NS, ROOT, GAS_PRICE, BACKFILL_KEYSET, client, retrying, pollMined, errorText, local,
+  sameKeyset, signGasSlot, validateKeyset, verifySigned, type Emitted, type Keyset, type Signed,
 } from './lib.js';
 
 function die(msg: string): never {
@@ -24,22 +27,22 @@ function die(msg: string): never {
   process.exit(1);
 }
 
+const args = process.argv.slice(2);
+// Before any argument is read: one containing 64 hex characters in a row is a secret that lost its way,
+// never a file name or a flag. It is refused without being repeated.
+if (args.some((a) => /[0-9a-fA-F]{64}/.test(a))) die('an argument contains 64 hex characters in a row — that looks like a secret key, so it was not used and is not repeated here. Pass the key FILE with --gas-key.');
 const USAGE = 'usage: npm run send-signed -- [--gas-key <key.json>] [--send] <command.json> …';
 let gasKeyPath = '';
 let doSend = false;
 const files: string[] = [];
-const args = process.argv.slice(2);
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   if (a === '--gas-key') gasKeyPath = args[++i] ?? '';
   else if (a === '--send') doSend = true;
-  else if (a.startsWith('--')) die(`unknown flag ${a}\n${USAGE}`);
+  else if (a.startsWith('--')) die(`unknown flag\n${USAGE}`);
   else files.push(a);
 }
-// A 64-hex argument is a secret that lost its way, never a file name: refuse it by its shape, before
-// any error message could echo it back.
-if ([gasKeyPath, ...files].some((f) => /^[0-9a-fA-F]{64}$/.test(f))) die('an argument is 64 hex characters — that looks like a secret, not a file path');
-if (args.includes('--gas-key') && !gasKeyPath) die(`--gas-key needs a file path\n${USAGE}`);
+if (args.includes('--gas-key') && (!gasKeyPath || gasKeyPath.startsWith('--'))) die(`--gas-key needs a file path\n${USAGE}`);
 if (!files.length) die(USAGE);
 
 let gasKey: { secretKey: string; publicKey?: string } | null = null;
@@ -48,57 +51,91 @@ if (gasKeyPath) {
   try { raw = readFileSync(gasKeyPath, 'utf8'); } catch { die(`cannot read the gas key file ${gasKeyPath}`); }
   try { const j = JSON.parse(raw); gasKey = { secretKey: j.secretKey, publicKey: j.publicKey }; }
   catch { die(`${gasKeyPath} is not a JSON key file {publicKey, secretKey}`); }
-  if ((statSync(gasKeyPath).mode & 0o077) !== 0) console.log(`  note: ${gasKeyPath} is readable by other users — chmod 600 is recommended`);
+  const mode = statSync(gasKeyPath).mode & 0o777;
+  if ((mode & 0o077) !== 0) {
+    if (doSend) die(`${gasKeyPath} is accessible to other users (mode ${mode.toString(8)}) — run chmod 600 on it first`);
+    console.log(`  note: ${gasKeyPath} is accessible to other users (mode ${mode.toString(8)}); chmod 600 it before --send`);
+  }
 }
 
 const SOURCE = readFileSync(join(ROOT, 'pact', 'modules', 'block-history.pact'), 'utf8');
-let keyset: { keys: string[]; pred: string } | null = null;
+let keyset: Keyset | null = null;
 if (process.env.BH_BACKFILL_KEYSET) {
-  try { keyset = JSON.parse(process.env.BH_BACKFILL_KEYSET); } catch { die('BH_BACKFILL_KEYSET is not JSON'); }
+  try { keyset = validateKeyset(JSON.parse(process.env.BH_BACKFILL_KEYSET)); } catch (e: any) { die(`BH_BACKFILL_KEYSET: ${e?.message ?? e}`); }
 }
 const expect = { networkId: NETWORK_ID, ns: NS, source: SOURCE, keyset, gasPrice: GAS_PRICE };
 
-console.log(`send-signed → ${API}  ${doSend ? 'SEND' : '(check only — nothing is sent without --send)'}`);
-type Item = { file: string; signed: Signed; chainId: ChainId };
+console.log(`send-signed → ${API}  ${doSend ? 'SEND' : '(check only — nothing signed leaves this machine)'}`);
+type Item = { file: string; unsigned: Emitted; signed: Signed; chainId: ChainId; kind: 'keyset' | 'module' | 'signed-elsewhere'; fee: number };
 const items: Item[] = [];
 for (const f of files) {
   let tx: Emitted | null = null;
   try { tx = JSON.parse(readFileSync(f, 'utf8')); } catch { die(`${f}: not a readable command file`); }
-  let signed: Signed;
   if (gasKey) {
-    try { signed = signGasSlot(tx!, gasKey, expect); } catch (e: any) { die(`${f}: refused — ${e?.message ?? e}`); }
+    try {
+      const r = signGasSlot(tx!, gasKey, expect);
+      items.push({ file: f, unsigned: tx!, signed: r.signed, chainId: r.chainId, kind: r.kind, fee: r.fee });
+    } catch (e: any) { die(`${f}: refused — ${e?.message ?? e}`); }
   } else {
     const why = verifySigned(tx!, NETWORK_ID);
     if (why) die(`${f}: not sendable — ${why}`);
-    signed = tx as Signed;
+    const c = JSON.parse(tx!.cmd);
+    items.push({ file: f, unsigned: tx!, signed: tx as Signed, chainId: String(c.meta.chainId) as ChainId, kind: 'signed-elsewhere', fee: Number(c.meta.gasLimit) * Number(c.meta.gasPrice) });
   }
-  items.push({ file: f, signed, chainId: String(JSON.parse(tx!.cmd).meta.chainId) as ChainId });
 }
-console.log(`  ✓ ${items.length} command(s) ${gasKey ? 'signed and ' : ''}verified locally`);
-
-const toSend: Item[] = [];
+// Two commands of the same kind for one chain means a stale file from an earlier run; sending both
+// would mine the second as a failure and burn its whole gas limit.
+const seen = new Map<string, string>();
 for (const it of items) {
+  const k = `${it.chainId}/${it.kind === 'signed-elsewhere' ? it.signed.hash : it.kind}`;
+  const prev = seen.get(k);
+  if (prev) die(`${prev} and ${it.file} are both the ${it.kind} command for chain ${it.chainId} — delete the stale one`);
+  seen.set(k, it.file);
+}
+const maxFee = items.reduce((s, i) => s + i.fee, 0);
+console.log(`  ✓ ${items.length} command(s) ${gasKey ? 'signed and ' : ''}verified locally — maximum fee ${maxFee.toFixed(6)} KDA in total`);
+
+async function onChain(it: Item): Promise<any> {
   const d = { requestKey: it.signed.hash, chainId: it.chainId, networkId: NETWORK_ID };
-  const prior: any = ((await retrying('status', () => client.getStatus(d))) as any)[it.signed.hash];
+  return ((await retrying('status', () => client.getStatus(d))) as any)[it.signed.hash];
+}
+async function keysetIsOurs(chainId: ChainId): Promise<boolean> {
+  if (!keyset) return false;
+  const ks = await local(`(describe-keyset ${JSON.stringify(BACKFILL_KEYSET)})`, { chainId }).catch(() => null);
+  return sameKeyset(ks, keyset);
+}
+async function preflight(it: Item, signed: boolean): Promise<any> {
+  const cmd = signed ? it.signed : it.unsigned;
+  const r = await retrying('preflight', () => client.local(cmd as unknown as ICommand, { preflight: true, signatureVerification: signed }));
+  if (r.result.status !== 'success') die(`${it.file}: the node's preflight refused it — ${errorText(r)}`);
+  return r;
+}
+
+let ready = 0, skipped = 0, sent = 0;
+for (const it of items) {
+  const prior = await onChain(it);
   if (prior) {
     if (prior.result?.status !== 'success') die(`${it.file} is already on chain and FAILED there — ${errorText(prior)}`);
     console.log(`  · already on chain, skipped: ${it.file}`);
+    skipped++;
     continue;
   }
-  const pre = await retrying('preflight', () => client.local(it.signed as unknown as ICommand, { preflight: true, signatureVerification: true }));
-  if (pre.result.status !== 'success') die(`${it.file}: the node's preflight refused it — ${errorText(pre)}`);
-  console.log(`  ✓ preflight  chain ${it.chainId.padStart(2)}  gas ${(pre as any).gas}  ${it.file}`);
-  toSend.push(it);
-}
-if (!doSend) {
-  console.log(`\n  CHECK ONLY: ${toSend.length} ready, ${items.length - toSend.length} already on chain. Nothing was sent; re-run with --send to submit.`);
-  process.exit(0);
-}
-for (const it of toSend) {
+  if (it.kind === 'module' && !(await keysetIsOurs(it.chainId))) {
+    die(`${it.file}: the backfill keyset on chain ${it.chainId} is not ours yet — send its keyset command first, then confirm with npm run preflight`);
+  }
+  if (!doSend) {
+    const pre = await preflight(it, false);
+    console.log(`  ✓ preflight, unsigned  chain ${it.chainId.padStart(2)}  gas ${pre.gas}  ${it.file}`);
+    ready++;
+    continue;
+  }
+  const pre = await preflight(it, true);
   const desc = await retrying('submit', () => client.submit(it.signed as unknown as ICommand));
   if (desc.requestKey !== it.signed.hash) die(`${it.file}: the node returned request key ${desc.requestKey}, not the command's hash ${it.signed.hash}`);
   const r = await pollMined(desc.requestKey, it.chainId, it.file);
   if (r.result.status !== 'success') die(`${it.file}: MINED BUT FAILED — ${errorText(r)}`);
-  console.log(`  ✓ mined  chain ${it.chainId.padStart(2)}  height ${(r as any).metaData?.blockHeight}  gas ${(r as any).gas}  request key ${desc.requestKey}`);
+  console.log(`  ✓ mined  chain ${it.chainId.padStart(2)}  height ${(r as any).metaData?.blockHeight}  gas ${(r as any).gas} (preflight ${pre.gas})  request key ${desc.requestKey}`);
+  sent++;
 }
-console.log(`\n  SENT ${toSend.length}; ${items.length - toSend.length} were already on chain.`);
+if (!doSend) console.log(`\n  CHECK ONLY: ${ready} ready, ${skipped} already on chain. Nothing signed was sent anywhere; re-run with --send to submit.`);
+else console.log(`\n  SENT ${sent}; ${skipped} were already on chain.`);

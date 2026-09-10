@@ -208,66 +208,104 @@ export async function sendExpectFail(s: TxSpec, mustContain: string): Promise<st
 // signature on them can pay gas and nothing more.
 export const KEYSET_GAS_LIMIT = 2000;
 export const MODULE_GAS_LIMIT = 120000;
+// Ten times the network's minimum price: a mistyped BH_GAS_PRICE stops here instead of being signed.
+export const MAX_GAS_PRICE = 1e-7;
 export const keysetDeployCode = (ns: string) =>
   `(namespace ${JSON.stringify(ns)}) (define-keyset ${JSON.stringify(`${ns}.block-history-backfill`)} (read-keyset "ks"))`;
 export const sameKeyset = (a: any, b: { keys: string[]; pred: string }) =>
   !!a && a.pred === b.pred && Array.isArray(a.keys) && a.keys.length === b.keys.length
   && [...a.keys].sort().join() === [...b.keys].sort().join();
 
+export type Keyset = { keys: string[]; pred: string };
+// The backfill keyset is permanent once claimed, so a malformed one must never reach a command. Pact
+// treats a keys-all over no keys as always satisfied (anyone could backfill) and keys-2 over one key
+// as never satisfiable (backfill dead forever). Throws naming the problem.
+export function validateKeyset(ks: any): Keyset {
+  if (!ks || typeof ks !== 'object' || !Array.isArray(ks.keys)) throw new Error('keyset-shape: must be {"keys": [...], "pred": "..."}');
+  const extra = Object.keys(ks).filter((k) => k !== 'keys' && k !== 'pred');
+  if (extra.length) throw new Error(`keyset-field: unexpected field(s) ${extra.join(', ')}`);
+  if (!['keys-all', 'keys-any', 'keys-2'].includes(ks.pred)) throw new Error(`keyset-pred: pred must be keys-all, keys-any or keys-2, got ${JSON.stringify(ks.pred)}`);
+  if (ks.keys.length === 0) throw new Error('keyset-empty: it has no keys, and Pact would let anyone satisfy it');
+  if (!ks.keys.every((k: unknown) => typeof k === 'string' && /^[0-9a-f]{64}$/.test(k))) throw new Error('keyset-hex: every key must be 64 lower-case hex characters');
+  if (new Set(ks.keys).size !== ks.keys.length) throw new Error('keyset-repeat: a key is listed twice');
+  if (ks.pred === 'keys-2' && ks.keys.length < 2) throw new Error('keyset-threshold: keys-2 needs at least two keys');
+  return { keys: ks.keys, pred: ks.pred };
+}
+
 export type Emitted = { cmd: string; hash: string; sigs: ({ pubKey?: string; sig?: string } | null)[] };
 export type Signed = { cmd: string; hash: string; sigs: { sig: string }[] };
 
+// The ONE builder for the deploy's commands: deploy.ts writes with it, and signGasSlot rebuilds with it
+// to demand the exact same bytes. The nonce is set explicitly (default derived from chain and time) so a
+// rebuild from the file's own nonce serialises identically.
 export function buildUnsignedGasOnly(s: {
   code: string; data: Record<string, any>; chainId: ChainId; sender: string; signerPubKey: string;
-  gasLimit: number; creationTime: number; gasPrice?: number; networkId?: string;
+  gasLimit: number; creationTime: number; gasPrice?: number; networkId?: string; nonce?: string;
 }): Emitted {
   let b: any = Pact.builder.execution(s.code).addSigner(s.signerPubKey, (wc: WithCap) => [wc('coin.GAS')]);
   for (const [k, v] of Object.entries(s.data)) b = b.addData(k, v);
   const tx: IUnsignedCommand = b
     .setMeta({ chainId: s.chainId, senderAccount: s.sender, gasLimit: s.gasLimit, gasPrice: s.gasPrice ?? GAS_PRICE, ttl: 28800, creationTime: s.creationTime })
     .setNetworkId(s.networkId ?? NETWORK_ID)
+    .setNonce(s.nonce ?? `block-history:${s.chainId}:${s.creationTime}`)
     .createTransaction();
   return { cmd: tx.cmd, hash: tx.hash, sigs: [{ pubKey: s.signerPubKey }] };
 }
 
-export type DeployExpect = { networkId: string; ns: string; source: string; keyset: { keys: string[]; pred: string } | null; gasPrice: number };
+export type DeployExpect = { networkId: string; ns: string; source: string; keyset: Keyset | null; gasPrice: number };
+export type GasSigned = { signed: Signed; kind: 'keyset' | 'module'; chainId: ChainId; fee: number };
 
 // Signs the gas payer's slot of ONE emitted deploy command, or throws naming the guard that refused.
-// Pure — no network, nothing printed. Every check runs BEFORE anything is signed.
-export function signGasSlot(tx: Emitted, gasKey: { secretKey: string; publicKey?: string }, x: DeployExpect): Signed {
-  if (typeof gasKey.secretKey !== 'string' || !/^[0-9a-f]{64}$/.test(gasKey.secretKey)) throw new Error('key file: secretKey must be 64 hex characters');
+// Pure — no network, nothing printed. Every check runs BEFORE anything is signed, and the last one
+// rebuilds the command from what it must contain and demands the file's bytes be exactly that.
+export function signGasSlot(tx: Emitted, gasKey: { secretKey: string; publicKey?: string }, x: DeployExpect): GasSigned {
+  const fail: (code: string, msg: string) => never = (code, msg) => { throw new Error(`${code}: ${msg}`); };
+  if (typeof gasKey.secretKey !== 'string' || !/^[0-9a-f]{64}$/.test(gasKey.secretKey)) fail('key-file-secret', 'secretKey must be 64 hex characters');
   const pub = restoreKeyPairFromSecretKey(gasKey.secretKey).publicKey;
-  if (gasKey.publicKey !== undefined && gasKey.publicKey !== pub) throw new Error('key file: its publicKey does not belong to its secretKey');
+  if (gasKey.publicKey !== undefined && gasKey.publicKey !== pub) fail('key-file-public', 'its publicKey does not belong to its secretKey');
+  if (!(typeof x.gasPrice === 'number' && x.gasPrice > 0 && x.gasPrice <= MAX_GAS_PRICE)) fail('gas-price-ceiling', `the configured gas price ${x.gasPrice} is outside (0, ${MAX_GAS_PRICE}]`);
   let cmd: any;
-  try { cmd = JSON.parse(tx.cmd); } catch { throw new Error('format: the command is not JSON'); }
+  try { cmd = JSON.parse(tx.cmd); } catch { fail('format-json', 'the command is not JSON'); }
   // Exactly the bytes the deploy tool writes (JSON.stringify of the command). A duplicated key or odd
   // encoding could make this parser and the node's read different commands from the same text.
-  if (JSON.stringify(cmd) !== tx.cmd) throw new Error('format: the command is not in the exact form the deploy tool writes');
-  if (cmd.networkId !== x.networkId) throw new Error(`network: the command is for ${cmd.networkId}, this run targets ${x.networkId}`);
-  if (blakeHash(tx.cmd) !== tx.hash) throw new Error('hash: the file hash does not match its command');
-  if (cmd.meta?.sender !== `k:${pub}`) throw new Error(`sender: the command's gas payer is ${cmd.meta?.sender}, not this key's account k:${pub}`);
+  if (JSON.stringify(cmd) !== tx.cmd) fail('format-exact', 'the command is not in the exact form the deploy tool writes');
+  if (cmd.networkId !== x.networkId) fail('network', `the command is for ${cmd.networkId}, this run targets ${x.networkId}`);
+  if (blakeHash(tx.cmd) !== tx.hash) fail('hash', 'the file hash does not match its command');
+  if (cmd.meta?.sender !== `k:${pub}`) fail('sender', `the command's gas payer is ${cmd.meta?.sender}, not this key's account k:${pub}`);
   const signers = Array.isArray(cmd.signers) ? cmd.signers : [];
-  if (signers.length !== 1 || signers[0].pubKey !== pub) throw new Error('signers: the command must have exactly one signer, this key');
+  if (signers.length !== 1 || signers[0].pubKey !== pub) fail('signers', 'the command must have exactly one signer, this key');
   const clist = Array.isArray(signers[0].clist) ? signers[0].clist : [];
-  if (clist.length !== 1 || clist[0].name !== 'coin.GAS' || (clist[0].args ?? []).length !== 0) throw new Error('scope: the signature must be scoped to coin.GAS alone');
-  if (Number(cmd.meta.gasPrice) !== x.gasPrice) throw new Error(`gas price: ${cmd.meta.gasPrice}, expected ${x.gasPrice}`);
+  if (clist.length !== 1 || clist[0].name !== 'coin.GAS' || !Array.isArray(clist[0].args) || clist[0].args.length !== 0) fail('scope', 'the signature must be scoped to coin.GAS alone');
+  if (cmd.meta.gasPrice !== x.gasPrice) fail('gas-price', `${JSON.stringify(cmd.meta.gasPrice)}, expected ${x.gasPrice}`);
+  const chainId = cmd.meta.chainId;
+  if (typeof chainId !== 'string' || !/^1?[0-9]$/.test(chainId)) fail('chain', `not a chain id 0-19: ${JSON.stringify(chainId)}`);
+  if (!Number.isInteger(cmd.meta.creationTime) || cmd.meta.creationTime <= 0) fail('creation-time', `not a positive whole number of seconds: ${JSON.stringify(cmd.meta.creationTime)}`);
+  if (typeof cmd.nonce !== 'string') fail('nonce', 'the nonce must be a string');
   const code = cmd.payload?.exec?.code;
-  const data = cmd.payload?.exec?.data ?? {};
-  const fields = Object.keys(data).sort().join(',');
-  let limit: number;
+  const data = cmd.payload?.exec?.data;
+  let kind: 'keyset' | 'module', limit: number, expectData: Record<string, any>;
   if (code === keysetDeployCode(x.ns)) {
-    if (fields !== 'ks' || !x.keyset || !sameKeyset(data.ks, x.keyset)) throw new Error('content: the keyset in this command is not the configured backfill keyset (BH_BACKFILL_KEYSET)');
-    limit = KEYSET_GAS_LIMIT;
+    if (!x.keyset) fail('content-keyset', 'no backfill keyset is configured (BH_BACKFILL_KEYSET)');
+    try { validateKeyset(x.keyset); } catch (e: any) { fail('content-keyset', `the configured backfill keyset is invalid — ${e?.message ?? e}`); }
+    if (!data || !sameKeyset(data.ks, x.keyset!)) fail('content-keyset', 'the keyset in this command is not the configured backfill keyset');
+    kind = 'keyset'; limit = KEYSET_GAS_LIMIT; expectData = { ks: x.keyset };
   } else if (code === x.source) {
-    if (fields !== 'ns' || data.ns !== x.ns) throw new Error(`content: the module command's data must be exactly {"ns": "${x.ns}"}`);
-    limit = MODULE_GAS_LIMIT;
+    if (!data || data.ns !== x.ns) fail('content-module', `the module command's namespace must be "${x.ns}"`);
+    kind = 'module'; limit = MODULE_GAS_LIMIT; expectData = { ns: x.ns };
   } else {
-    throw new Error('content: neither the backfill keyset definition nor the exact module source — refusing to sign');
+    fail('content-shape', 'neither the backfill keyset definition nor the exact module source — refusing to sign');
   }
-  if (Number(cmd.meta.gasLimit) > limit) throw new Error(`gas limit: ${cmd.meta.gasLimit} is above ${limit} for this command`);
+  if (cmd.meta.gasLimit !== limit!) fail('gas-limit', `${JSON.stringify(cmd.meta.gasLimit)}, expected exactly ${limit!} for this command`);
+  // The catch-all: rebuild from what the command must contain; no field this function does not name
+  // (ttl, an extra key, a continuation, verifiers, a signer scheme, …) can ride along.
+  const rebuilt = buildUnsignedGasOnly({
+    code, data: expectData!, chainId: chainId as ChainId, sender: `k:${pub}`, signerPubKey: pub, gasLimit: limit!, gasPrice: x.gasPrice,
+    creationTime: cmd.meta.creationTime, networkId: x.networkId, nonce: cmd.nonce,
+  });
+  if (rebuilt.cmd !== tx.cmd) fail('exact', 'the command differs from the one the deploy tool writes for this content');
   const sig = signHash(tx.hash, { publicKey: pub, secretKey: gasKey.secretKey }).sig;
-  if (!sig || !verifySig(base64UrlDecodeArr(tx.hash), hexToBin(sig), hexToBin(pub))) throw new Error('signature: it did not verify');
-  return { cmd: tx.cmd, hash: tx.hash, sigs: [{ sig }] };
+  if (!sig || !verifySig(base64UrlDecodeArr(tx.hash), hexToBin(sig), hexToBin(pub))) fail('signature', 'it did not verify');
+  return { signed: { cmd: tx.cmd, hash: tx.hash, sigs: [{ sig: sig! }] }, kind: kind!, chainId: chainId as ChainId, fee: limit! * x.gasPrice };
 }
 
 // For commands signed elsewhere: every signer slot is filled and verifies against the command's

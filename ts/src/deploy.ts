@@ -20,7 +20,7 @@ import type { ChainId } from '@kadena/client';
 import {
   API, NETWORK_ID, NS, MODULE, BACKFILL_KEYSET, OUT, ROOT, SENDER00, isDevnet, keyPath,
   loadOrCreateKey, accountOf, keysetOf, parseChains, local, send, balance, chainTime, type TxSpec, type Keypair,
-  sameKeyset, keysetDeployCode, buildUnsignedGasOnly, KEYSET_GAS_LIMIT, MODULE_GAS_LIMIT,
+  sameKeyset, keysetDeployCode, buildUnsignedGasOnly, validateKeyset, KEYSET_GAS_LIMIT, MODULE_GAS_LIMIT,
 } from './lib.js';
 
 const UNSIGNED = process.argv.includes('--unsigned');
@@ -57,14 +57,9 @@ const adminPubKey: string = (() => {
 const backfillKeyset = (() => {
   const raw = process.env.BH_BACKFILL_KEYSET;
   if (!raw) return keysetOf(backfillKey());
-  const ks = JSON.parse(raw);
-  if (!Array.isArray(ks.keys) || !ks.keys.every((k: unknown) => typeof k === 'string' && /^[0-9a-f]{64}$/.test(k)) || !['keys-all', 'keys-any', 'keys-2'].includes(ks.pred)) {
-    throw new Error('BH_BACKFILL_KEYSET must be {"keys":[64-hex…],"pred":"keys-all"|"keys-any"|"keys-2"}');
-  }
-  return ks as { keys: string[]; pred: string };
+  try { return validateKeyset(JSON.parse(raw)); } catch (e: any) { throw new Error(`BH_BACKFILL_KEYSET: ${e?.message ?? e}`); }
 })();
 
-let seq = 0;
 // The gas payer is the only signer, scoped to coin.GAS (lib.ts: buildUnsignedGasOnly). Sign and send
 // the files with `npm run send-signed -- --gas-key <key.json> …`, which accepts nothing else.
 async function writeUnsigned(s: TxSpec, signerKey: string): Promise<void> {
@@ -74,7 +69,8 @@ async function writeUnsigned(s: TxSpec, signerKey: string): Promise<void> {
     gasLimit: s.gasLimit ?? MODULE_GAS_LIMIT, gasPrice: s.gasPrice, creationTime: Math.floor(now.getTime() / 1000) - 15,
   });
   mkdirSync(join(OUT, 'unsigned'), { recursive: true });
-  const p = join(OUT, 'unsigned', `${String(++seq).padStart(2, '0')}-chain${s.chainId}-${s.label.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`);
+  // One file per chain and command, so a re-run replaces its own stale file instead of adding a second.
+  const p = join(OUT, 'unsigned', `chain${String(s.chainId).padStart(2, '0')}-${s.label.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`);
   writeFileSync(p, JSON.stringify(tx, null, 2) + '\n');
   console.log(`  ✎ chain ${s.chainId}: ${s.label} → ${p}`);
 }
