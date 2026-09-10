@@ -236,8 +236,8 @@ export type Emitted = { cmd: string; hash: string; sigs: ({ pubKey?: string; sig
 export type Signed = { cmd: string; hash: string; sigs: { sig: string }[] };
 
 // The ONE builder for the deploy's commands: deploy.ts writes with it, and signGasSlot rebuilds with it
-// to demand the exact same bytes. The nonce is set explicitly (default derived from chain and time) so a
-// rebuild from the file's own nonce serialises identically.
+// to demand the exact same bytes. The nonce is derived from the chain and the creation time, so the
+// rebuild reproduces it exactly and a file cannot carry any other text there.
 export function buildUnsignedGasOnly(s: {
   code: string; data: Record<string, any>; chainId: ChainId; sender: string; signerPubKey: string;
   gasLimit: number; creationTime: number; gasPrice?: number; networkId?: string; nonce?: string;
@@ -252,7 +252,8 @@ export function buildUnsignedGasOnly(s: {
   return { cmd: tx.cmd, hash: tx.hash, sigs: [{ pubKey: s.signerPubKey }] };
 }
 
-export type DeployExpect = { networkId: string; ns: string; source: string; keyset: Keyset | null; gasPrice: number };
+// `now` is the target chain's own time in seconds: a command is signed only while that chain would accept it.
+export type DeployExpect = { networkId: string; ns: string; source: string; keyset: Keyset | null; gasPrice: number; now: number };
 export type GasSigned = { signed: Signed; kind: 'keyset' | 'module'; chainId: ChainId; fee: number };
 
 // Signs the gas payer's slot of ONE emitted deploy command, or throws naming the guard that refused.
@@ -273,20 +274,23 @@ export function signGasSlot(tx: Emitted, gasKey: { secretKey: string; publicKey?
   if (blakeHash(tx.cmd) !== tx.hash) fail('hash', 'the file hash does not match its command');
   if (cmd.meta?.sender !== `k:${pub}`) fail('sender', `the command's gas payer is ${cmd.meta?.sender}, not this key's account k:${pub}`);
   const signers = Array.isArray(cmd.signers) ? cmd.signers : [];
-  if (signers.length !== 1 || signers[0].pubKey !== pub) fail('signers', 'the command must have exactly one signer, this key');
-  const clist = Array.isArray(signers[0].clist) ? signers[0].clist : [];
+  const s0 = signers[0];
+  if (signers.length !== 1 || !s0 || typeof s0 !== 'object' || s0.pubKey !== pub) fail('signers', 'the command must have exactly one signer, this key');
+  const clist = Array.isArray(s0.clist) ? s0.clist : [];
   if (clist.length !== 1 || clist[0].name !== 'coin.GAS' || !Array.isArray(clist[0].args) || clist[0].args.length !== 0) fail('scope', 'the signature must be scoped to coin.GAS alone');
   if (cmd.meta.gasPrice !== x.gasPrice) fail('gas-price', `${JSON.stringify(cmd.meta.gasPrice)}, expected ${x.gasPrice}`);
   const chainId = cmd.meta.chainId;
   if (typeof chainId !== 'string' || !/^1?[0-9]$/.test(chainId)) fail('chain', `not a chain id 0-19: ${JSON.stringify(chainId)}`);
-  if (!Number.isInteger(cmd.meta.creationTime) || cmd.meta.creationTime <= 0) fail('creation-time', `not a positive whole number of seconds: ${JSON.stringify(cmd.meta.creationTime)}`);
+  const ct = cmd.meta.creationTime;
+  if (!Number.isInteger(ct) || ct <= 0) fail('creation-time', `not a positive whole number of seconds: ${JSON.stringify(ct)}`);
+  if (!(Number.isFinite(x.now) && ct >= x.now - 28800 && ct <= x.now + 60)) fail('creation-time-window', `created at ${ct}, outside the 8 hours before this chain's time ${x.now} — rebuild the file`);
   if (typeof cmd.nonce !== 'string') fail('nonce', 'the nonce must be a string');
   const code = cmd.payload?.exec?.code;
   const data = cmd.payload?.exec?.data;
   let kind: 'keyset' | 'module', limit: number, expectData: Record<string, any>;
   if (code === keysetDeployCode(x.ns)) {
-    if (!x.keyset) fail('content-keyset', 'no backfill keyset is configured (BH_BACKFILL_KEYSET)');
-    try { validateKeyset(x.keyset); } catch (e: any) { fail('content-keyset', `the configured backfill keyset is invalid — ${e?.message ?? e}`); }
+    if (!x.keyset) fail('content-keyset-missing', 'no backfill keyset is configured (BH_BACKFILL_KEYSET)');
+    try { validateKeyset(x.keyset); } catch (e: any) { fail('content-keyset-invalid', `the configured backfill keyset is invalid — ${e?.message ?? e}`); }
     if (!data || !sameKeyset(data.ks, x.keyset!)) fail('content-keyset', 'the keyset in this command is not the configured backfill keyset');
     kind = 'keyset'; limit = KEYSET_GAS_LIMIT; expectData = { ks: x.keyset };
   } else if (code === x.source) {
@@ -300,12 +304,28 @@ export function signGasSlot(tx: Emitted, gasKey: { secretKey: string; publicKey?
   // (ttl, an extra key, a continuation, verifiers, a signer scheme, …) can ride along.
   const rebuilt = buildUnsignedGasOnly({
     code, data: expectData!, chainId: chainId as ChainId, sender: `k:${pub}`, signerPubKey: pub, gasLimit: limit!, gasPrice: x.gasPrice,
-    creationTime: cmd.meta.creationTime, networkId: x.networkId, nonce: cmd.nonce,
+    creationTime: ct, networkId: x.networkId,
   });
   if (rebuilt.cmd !== tx.cmd) fail('exact', 'the command differs from the one the deploy tool writes for this content');
   const sig = signHash(tx.hash, { publicKey: pub, secretKey: gasKey.secretKey }).sig;
   if (!sig || !verifySig(base64UrlDecodeArr(tx.hash), hexToBin(sig), hexToBin(pub))) fail('signature', 'it did not verify');
   return { signed: { cmd: tx.cmd, hash: tx.hash, sigs: [{ sig: sig! }] }, kind: kind!, chainId: chainId as ChainId, fee: limit! * x.gasPrice };
+}
+
+// The body a check-only preflight sends: the command and its signer slots with NO signature. Built from
+// the parsed command, never forwarded from the file, so a signature a file may carry never leaves this
+// machine.
+export function unsignedBody(tx: { cmd: string; hash: string }): Emitted {
+  const signers = JSON.parse(tx.cmd)?.signers;
+  return { cmd: tx.cmd, hash: tx.hash, sigs: (Array.isArray(signers) ? signers : []).map((s: any) => ({ pubKey: s?.pubKey })) };
+}
+
+// Which of the deploy's two commands a command is, by its code alone; 'other' for anything else, such as
+// a backfill batch. Commands signed elsewhere are deduplicated and gated by it too.
+export function commandKind(cmdText: string, ns: string, source: string): 'keyset' | 'module' | 'other' {
+  let code: unknown;
+  try { code = JSON.parse(cmdText)?.payload?.exec?.code; } catch { return 'other'; }
+  return code === keysetDeployCode(ns) ? 'keyset' : code === source ? 'module' : 'other';
 }
 
 // For commands signed elsewhere: every signer slot is filled and verifies against the command's

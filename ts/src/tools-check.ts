@@ -10,7 +10,8 @@ import { join } from 'node:path';
 import { genKeyPair, hash as blakeHash } from '@kadena/cryptography-utils';
 import {
   ROOT, parseChains, parseBinaryHeader, pactTime, microsOf,
-  buildUnsignedGasOnly, keysetDeployCode, signGasSlot, validateKeyset, verifySigned, type Emitted, type DeployExpect,
+  buildUnsignedGasOnly, keysetDeployCode, signGasSlot, validateKeyset, verifySigned, unsignedBody, commandKind,
+  type Emitted, type DeployExpect,
 } from './lib.js';
 
 let fails = 0;
@@ -58,9 +59,10 @@ const SRC = readFileSync(join(ROOT, 'pact', 'modules', 'block-history.pact'), 'u
 const kp = genKeyPair();   // throwaway, in memory only
 const gasKey = { publicKey: kp.publicKey, secretKey: kp.secretKey! };
 const NET = 'recap-development';
+const T = 1788310555;       // the commands' creation time; the chain's time is a little later
 const KS = { keys: [K('1'), K('2'), K('3')], pred: 'keys-2' };
-const X: DeployExpect = { networkId: NET, ns: 'free', source: SRC, keyset: KS, gasPrice: 1e-8 };
-const common = { chainId: '0' as const, sender: `k:${kp.publicKey}`, signerPubKey: kp.publicKey, creationTime: 1788310555, gasPrice: 1e-8, networkId: NET };
+const X: DeployExpect = { networkId: NET, ns: 'free', source: SRC, keyset: KS, gasPrice: 1e-8, now: T + 100 };
+const common = { chainId: '0' as const, sender: `k:${kp.publicKey}`, signerPubKey: kp.publicKey, creationTime: T, gasPrice: 1e-8, networkId: NET };
 const ksCmd = buildUnsignedGasOnly({ ...common, code: keysetDeployCode('free'), data: { ks: KS }, gasLimit: 2000 });
 const modCmd = buildUnsignedGasOnly({ ...common, code: SRC, data: { ns: 'free' }, gasLimit: 120000 });
 // Change ONE thing and re-hash, so the hash check passes and the guard under test is what refuses.
@@ -76,7 +78,7 @@ check('gas signer: the builder scopes the one signature to coin.GAS alone', JSON
 check('gas signer: signs the keyset definition; the signature verifies', verifySigned(sign(ksCmd).signed, NET), null);
 check('gas signer: signs the exact module source; the signature verifies', verifySigned(sign(modCmd).signed, NET), null);
 check('gas signer: reports kind, chain and the maximum fee', (({ kind, chainId, fee }) => ({ kind, chainId, fee: Math.round(fee * 1e8) }))(sign(modCmd)), { kind: 'module', chainId: '0', fee: 120000 });
-check('gas signer: a rebuild from the file\'s own nonce is byte-identical (a real nonce round-trips)', verifySigned(sign(edit(ksCmd, (c) => { c.nonce = 'another nonce'; })).signed, NET), null);
+check('gas signer: signs at the far edge of the 8-hour window', verifySigned(sign(ksCmd, { ...X, now: T + 28800 }).signed, NET), null);
 
 refuses('refuses a command with a duplicated field', () => { const cmd = ksCmd.cmd.replace('{"exec":{', '{"exec":{"code":"(coin.details \\"x\\")",'); return sign({ ...ksCmd, cmd, hash: blakeHash(cmd) }); }, 'format-exact');
 refuses('refuses a command that is not JSON', () => sign({ ...ksCmd, cmd: '{not json', hash: blakeHash('{not json') }), 'format-json');
@@ -84,6 +86,7 @@ refuses('refuses a file whose hash does not match its command', () => sign({ ...
 refuses('refuses a command for another network', () => sign(edit(ksCmd, (c) => { c.networkId = 'mainnet01'; })), 'network');
 refuses('refuses a command paid by another account', () => sign(edit(ksCmd, (c) => { c.meta.sender = `k:${K('f')}`; })), 'sender');
 refuses('refuses a second signer', () => sign(edit(ksCmd, (c) => { c.signers.push({ pubKey: K('e'), clist: [] }); })), 'signers');
+refuses('refuses a signer slot that is not an object', () => sign(edit(ksCmd, (c) => { c.signers = [null]; })), 'signers');
 refuses('refuses an unscoped signature', () => sign(edit(ksCmd, (c) => { c.signers[0].clist = []; })), 'scope');
 refuses('refuses a TRANSFER capability', () => sign(edit(ksCmd, (c) => { c.signers[0].clist = [{ name: 'coin.TRANSFER', args: [c.meta.sender, 'k:x', { decimal: '1.0' }] }]; })), 'scope');
 refuses('refuses coin.GAS without its (empty) argument list', () => sign(edit(ksCmd, (c) => { delete c.signers[0].clist[0].args; })), 'scope');
@@ -92,6 +95,12 @@ refuses('refuses a gas price written as a string', () => sign(edit(ksCmd, (c) =>
 refuses('refuses a configured gas price above the ceiling', () => sign(ksCmd, { ...X, gasPrice: 1e-5 }), 'gas-price-ceiling');
 refuses('refuses a chain id outside 0-19', () => sign(edit(ksCmd, (c) => { c.meta.chainId = '20'; })), 'chain');
 refuses('refuses a chain id that is not a number', () => sign(edit(ksCmd, (c) => { c.meta.chainId = '../x'; })), 'chain');
+refuses('refuses a creation time written as a string', () => sign(edit(ksCmd, (c) => { c.meta.creationTime = String(c.meta.creationTime); })), 'creation-time');
+refuses('refuses a command created more than 8 hours before the chain\'s time', () => sign(ksCmd, { ...X, now: T + 28801 }), 'creation-time-window');
+refuses('refuses a command created in the chain\'s future', () => sign(ksCmd, { ...X, now: T - 61 }), 'creation-time-window');
+refuses('refuses when the chain\'s time is unknown', () => sign(ksCmd, { ...X, now: NaN }), 'creation-time-window');
+refuses('refuses a nonce that is not a string', () => sign(edit(ksCmd, (c) => { c.nonce = 7; })), 'nonce');
+refuses('refuses a nonce other than the one the deploy tool derives', () => sign(edit(ksCmd, (c) => { c.nonce = 'another nonce'; })), 'exact');
 refuses('refuses a keyset command above its gas limit', () => sign(edit(ksCmd, (c) => { c.meta.gasLimit = 150000; })), 'gas-limit');
 refuses('refuses a module command above its gas limit', () => sign(edit(modCmd, (c) => { c.meta.gasLimit = 150000; })), 'gas-limit');
 refuses('refuses a gas limit written as a string', () => sign(edit(ksCmd, (c) => { c.meta.gasLimit = '2000'; })), 'gas-limit');
@@ -99,20 +108,27 @@ refuses('refuses a negative gas limit', () => sign(edit(ksCmd, (c) => { c.meta.g
 refuses('refuses arbitrary code', () => sign(edit(ksCmd, (c) => { c.payload.exec.code = `(coin.transfer "${c.meta.sender}" "k:x" 1.0)`; })), 'content-shape');
 refuses('refuses a module source one character off', () => sign(edit(modCmd, (c) => { c.payload.exec.code = SRC + ' '; })), 'content-shape');
 refuses('refuses a different backfill keyset', () => sign(edit(ksCmd, (c) => { c.payload.exec.data.ks.keys[0] = K('a'); })), 'content-keyset');
-refuses('refuses a keyset command when no keyset is configured', () => sign(ksCmd, { ...X, keyset: null }), 'content-keyset');
-refuses('refuses a keyset command whose configured keyset is invalid (no keys)', () => { const empty = { keys: [] as string[], pred: 'keys-all' }; return sign(buildUnsignedGasOnly({ ...common, code: keysetDeployCode('free'), data: { ks: empty }, gasLimit: 2000 }), { ...X, keyset: empty }); }, 'content-keyset');
+refuses('refuses a keyset command when no keyset is configured', () => sign(ksCmd, { ...X, keyset: null }), 'content-keyset-missing');
+refuses('refuses a keyset command whose configured keyset is invalid (no keys)', () => { const empty = { keys: [] as string[], pred: 'keys-all' }; return sign(buildUnsignedGasOnly({ ...common, code: keysetDeployCode('free'), data: { ks: empty }, gasLimit: 2000 }), { ...X, keyset: empty }); }, 'content-keyset-invalid');
 refuses('refuses another namespace', () => sign(edit(modCmd, (c) => { c.payload.exec.data.ns = 'user'; })), 'content-module');
 refuses('refuses extra transaction data', () => sign(edit(modCmd, (c) => { c.payload.exec.data.extra = 1; })), 'exact');
 refuses('refuses a changed time-to-live', () => sign(edit(ksCmd, (c) => { c.meta.ttl = 1e9; })), 'exact');
 refuses('refuses an extra top-level field', () => sign(edit(ksCmd, (c) => { c.verifiers = []; })), 'exact');
 refuses('refuses a continuation riding beside the code', () => sign(edit(ksCmd, (c) => { c.payload.cont = { pactId: 'x', step: 1, rollback: false, data: {}, proof: null }; })), 'exact');
 refuses('refuses a different signature scheme', () => sign(edit(ksCmd, (c) => { c.signers[0].scheme = 'WebAuthn'; })), 'exact');
-refuses('refuses a creation time written as a string', () => sign(edit(ksCmd, (c) => { c.meta.creationTime = String(c.meta.creationTime); })), 'creation-time');
-refuses('refuses a nonce that is not a string', () => sign(edit(ksCmd, (c) => { c.nonce = 7; })), 'nonce');
 refuses('refuses a key file whose public key is not its own', () => signGasSlot(ksCmd, { secretKey: gasKey.secretKey, publicKey: K('b') }, X), 'key-file-public');
 refuses('refuses a malformed secret', () => signGasSlot(ksCmd, { secretKey: 'not-hex' }, X), 'key-file-secret');
 check('already-signed path refuses an unsigned command', (verifySigned(ksCmd, NET) ?? '').startsWith('signatures:'), true);
 check('already-signed path refuses a forged signature', (verifySigned({ ...sign(ksCmd).signed, sigs: [{ sig: '0'.repeat(128) }] }, NET) ?? '').startsWith('signatures:'), true);
+
+// ---- what check-only mode sends, and how commands are classified ---------------------------------
+const signedKs = sign(ksCmd).signed;
+check('check-only body carries the signer slot and NO signature, even from a signed file', unsignedBody(signedKs).sigs, [{ pubKey: kp.publicKey }]);
+check('check-only body keeps the command and its hash unchanged', [unsignedBody(signedKs).cmd === signedKs.cmd, unsignedBody(signedKs).hash === signedKs.hash], [true, true]);
+check('check-only body from a command with no signer list is empty, not a crash', unsignedBody(edit(ksCmd, (c) => { delete c.signers; })).sigs, []);
+check('classifies the keyset definition', commandKind(ksCmd.cmd, 'free', SRC), 'keyset');
+check('classifies the module deploy', commandKind(modCmd.cmd, 'free', SRC), 'module');
+check('classifies anything else as other', commandKind(edit(ksCmd, (c) => { c.payload.exec.code = '(free.block-history.close-backfill)'; }).cmd, 'free', SRC), 'other');
 
 console.log(fails ? `\n${fails} check(s) FAILED` : '\nall tool checks passed');
 process.exit(fails ? 1 : 0);

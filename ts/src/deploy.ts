@@ -14,7 +14,7 @@
 // owns backfill on that chain forever, because the module can never be upgraded. Hence the
 // two-pass rule enforced below: the module is never emitted or sent until the keyset is
 // confirmed on chain with our exact keys.
-import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChainId } from '@kadena/client';
 import {
@@ -60,6 +60,9 @@ const backfillKeyset = (() => {
   try { return validateKeyset(JSON.parse(raw)); } catch (e: any) { throw new Error(`BH_BACKFILL_KEYSET: ${e?.message ?? e}`); }
 })();
 
+// One file per chain and command, so a re-run replaces its own stale file instead of adding a second.
+const unsignedPath = (c: ChainId, label: string) =>
+  join(OUT, 'unsigned', `chain${String(c).padStart(2, '0')}-${label.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`);
 // The gas payer is the only signer, scoped to coin.GAS (lib.ts: buildUnsignedGasOnly). Sign and send
 // the files with `npm run send-signed -- --gas-key <key.json> …`, which accepts nothing else.
 async function writeUnsigned(s: TxSpec, signerKey: string): Promise<void> {
@@ -69,8 +72,7 @@ async function writeUnsigned(s: TxSpec, signerKey: string): Promise<void> {
     gasLimit: s.gasLimit ?? MODULE_GAS_LIMIT, gasPrice: s.gasPrice, creationTime: Math.floor(now.getTime() / 1000) - 15,
   });
   mkdirSync(join(OUT, 'unsigned'), { recursive: true });
-  // One file per chain and command, so a re-run replaces its own stale file instead of adding a second.
-  const p = join(OUT, 'unsigned', `chain${String(s.chainId).padStart(2, '0')}-${s.label.replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`);
+  const p = unsignedPath(s.chainId, s.label);
   writeFileSync(p, JSON.stringify(tx, null, 2) + '\n');
   console.log(`  ✎ chain ${s.chainId}: ${s.label} → ${p}`);
 }
@@ -110,6 +112,12 @@ async function deployChain(c: ChainId): Promise<{ chain: ChainId; hash: string; 
   // keyset a stranger could then claim.
   const existingKs = await local(`(describe-keyset ${JSON.stringify(BACKFILL_KEYSET)})`, { chainId: c }).catch(() => null);
   if (existingKs && !sameKeyset(existingKs, backfillKeyset)) throw new Error(`chain ${c}: ${BACKFILL_KEYSET} exists with OTHER keys ${JSON.stringify(existingKs.keys)} (${existingKs.pred}) — not ours; refusing (this chain is lost: the module is immutable and cannot be pointed at another keyset)`);
+  if (existingKs && UNSIGNED) {
+    // The keyset is ours on chain, so its command file is spent. Removing it means a pass-1 file re-sent
+    // late can never sit beside the module file and stop the next send.
+    const spent = unsignedPath(c, `define keyset ${BACKFILL_KEYSET}`);
+    if (existsSync(spent)) { unlinkSync(spent); console.log(`  ✓ chain ${c}: the keyset is ours — removed its spent file`); }
+  }
   if (!existingKs) {
     await step({
       label: `define keyset ${BACKFILL_KEYSET}`, chainId: c, sender: adminAcct, gasLimit: KEYSET_GAS_LIMIT,

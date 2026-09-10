@@ -264,7 +264,7 @@ requires a keyset signature, because claiming an unclaimed name in `free` is una
 file carries one signer, the gas payer, scoped to `coin.GAS`. `send-signed --gas-key` rebuilds each file
 from what it must contain — the backfill keyset definition carrying `BH_BACKFILL_KEYSET`, or the exact
 module source — at `BH_GAS_PRICE` (at most 1e-7) and the deploy's gas limits, and signs it only if the
-bytes match exactly. Without `--send`, nothing signed leaves the machine: each command is checked on the
+bytes match exactly and the chain would still accept it. Without `--send`, nothing signed leaves the machine: each command is checked on the
 node unsigned. With `--send`, the maximum fee is printed first, a module command goes only where the
 keyset is already ours, and each command is preflighted signed just before it is submitted. The key
 file must be readable by its owner alone; its secret is never printed; a re-run skips whatever is
