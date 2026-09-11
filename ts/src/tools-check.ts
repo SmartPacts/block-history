@@ -7,15 +7,20 @@
 // neighbouring guard unnoticed). The checks made before anything is signed, the rules for commands
 // signed elsewhere and for commands already on chain, and what a preflight sends in each mode are
 // checked the same way. So is the rule preflight and deploy apply to a chain that already carries the
-// module: ours only when one of the operator's own deploy files succeeded there, whatever the hash.
-import { readFileSync } from 'node:fs';
+// module: ours only when one of the operator's own deploy files, rebuilt byte for byte, succeeded there,
+// whatever the hash. So is what deploy does with a file already on disk: it keeps one whose command can
+// still land, and moves one aside, never deleting it, when that command failed, expired, or its chain is
+// LOST; the moves run in a throwaway directory.
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { genKeyPair, hash as blakeHash } from '@kadena/cryptography-utils';
+import { genKeyPair, hash as blakeHash, signHash } from '@kadena/cryptography-utils';
 import {
   ROOT, parseChains, parseBinaryHeader, pactTime, microsOf,
   buildUnsignedGasOnly, signGasSlot, verifySigned, unsignedBody, commandKind,
   fileChain, statusDecision, relayKind, spentKind, preflightRequest, errorText, proofChain, ownership,
-  type Emitted, type DeployExpect,
+  readDeployFiles, supersede, fileFate, planChain, validUntil, utc,
+  type Emitted, type DeployExpect, type FileFate,
 } from './lib.js';
 
 let fails = 0;
@@ -180,10 +185,10 @@ refuses('spent, signed elsewhere: a command not in the exact form stops the run'
 const P = { networkId: NET, ns: 'free', source: SRC };
 const landedAs = (...keys: string[]): Record<string, any> => Object.fromEntries(keys.map((k) => [k, { result: { status: 'success', data: 'Loaded module free.block-history' } }]));
 const refusedAs = (k: string): Record<string, any> => ({ [k]: { result: { status: 'failure', error: { message: 'block-history is immutable: it can never be upgraded' } } } });
-const own = (present: boolean, files: Emitted[], statuses: Record<string, any>, x = P, chainId: '0' | '1' = '0') => outcome(() => ownership({ present, chainId, files, statuses }, x));
-const deployFile = (o: { chainId?: '0' | '1'; creationTime?: number; networkId?: string }) => buildUnsignedGasOnly({
-  chainId: o.chainId ?? '0', sender: `k:${kp.publicKey}`, signerPubKey: kp.publicKey, creationTime: o.creationTime ?? T, gasPrice: 1e-8,
-  networkId: o.networkId ?? NET, code: SRC, data: { ns: 'free' }, gasLimit: 120000,
+const own = (present: boolean, files: { cmd: string; hash: string }[], statuses: Record<string, any>, x = P, chainId: '0' | '1' = '0') => outcome(() => ownership({ present, chainId, files, statuses }, x));
+const deployFile = (o: { chainId?: '0' | '1'; creationTime?: number; networkId?: string; gasPrice?: number; ttl?: number }) => buildUnsignedGasOnly({
+  chainId: o.chainId ?? '0', sender: `k:${kp.publicKey}`, signerPubKey: kp.publicKey, creationTime: o.creationTime ?? T, gasPrice: o.gasPrice ?? 1e-8,
+  networkId: o.networkId ?? NET, code: SRC, data: { ns: 'free' }, gasLimit: 120000, ttl: o.ttl,
 });
 // Someone else's copy on chain 0: the same module code plus a write of its own, so a request key of its own.
 const copy = edit(modCmd, (c) => { c.payload.exec.code = `${SRC}\n(write latest-tbl "latest" { "height": 9 })`; });
@@ -215,6 +220,61 @@ refuses('proof: a deploy file for another network', () => proofChain(mainnetFile
 refuses('proof: a deploy file for another namespace', () => proofChain(modCmd, { ...P, ns: 'user' }), 'content-module');
 refuses('proof: a command that is not the module deploy', () => proofChain(callFile, P), 'proof-other');
 refuses('proof: a module source one character off', () => proofChain(edit(modCmd, (c) => { c.payload.exec.code = SRC + ' '; }), P), 'content-definition');
+
+// ---- the proof demands the exact payload: proofChain rebuilds with the deploy's own builder -------------
+refuses('proof: an extra data key', () => proofChain(edit(modCmd, (c) => { c.payload.exec.data.extra = 1; }), P), 'exact');
+refuses('proof: a continuation riding beside the code', () => proofChain(edit(modCmd, (c) => { c.payload.cont = { pactId: 'x', step: 1, rollback: false, data: {}, proof: null }; }), P), 'exact');
+refuses('proof: a verifier', () => proofChain(edit(modCmd, (c) => { c.verifiers = [{ name: 'v', proof: 'p', clist: [] }]; }), P), 'exact');
+refuses('proof: a second signer', () => proofChain(edit(modCmd, (c) => { c.signers.push({ pubKey: K('e'), scheme: 'ED25519', clist: [] }); }), P), 'exact');
+refuses('proof: a nonce the deploy tool does not derive', () => proofChain(edit(modCmd, (c) => { c.nonce = 'another nonce'; }), P), 'exact');
+const pricier = deployFile({ gasPrice: 2e-8 });
+check('proof: a file written at another gas price proves its chain', [outcome(() => proofChain(pricier, P)), own(true, [pricier], landedAs(pricier.hash))], ['0', 'ours']);
+const longer = deployFile({ ttl: 3600 });
+check('proof: a file written with another ttl proves its chain', [outcome(() => proofChain(longer, P)), own(true, [longer], landedAs(longer.hash))], ['0', 'ours']);
+const direct = deployFile({ ttl: 1800 });
+const directFile = { ...direct, sigs: [{ sig: signHash(direct.hash, gasKey).sig }] };
+check('proof: a direct devnet deploy\'s file (the same builder, then signed) proves its chain', outcome(() => proofChain(directFile, P)), '0');
+
+// ---- a deploy file is never destroyed (deploy: fileFate, planChain, supersede) -----------------------
+const until = T + 28800;   // modCmd was created at T with the builder's 8-hour ttl
+const failedThere = refusedAs(modCmd.hash)[modCmd.hash];
+const succeededThere = landedAs(modCmd.hash)[modCmd.hash];
+check('fate fixture: a command can land until its creation time plus its ttl', validUntil(modCmd.cmd), until);
+check('fate: no status, within its ttl — kept, until creation time plus ttl', fileFate(modCmd, '0', undefined, T + 100), { fate: 'keep', why: `its command can still land until ${utc(until)}` });
+check('fate: at exactly creation time plus ttl — still kept', fileFate(modCmd, '0', undefined, until).fate, 'keep');
+check('fate: one second later — superseded as expired', fileFate(modCmd, '0', undefined, until + 1), { fate: 'supersede', why: `its command expired at ${utc(until)}` });
+check('fate: its command failed on this chain — superseded, even within its ttl', fileFate(modCmd, '0', failedThere, T + 100).fate, 'supersede');
+check('fate: its command succeeded on this chain — kept, even past its ttl', fileFate(modCmd, '0', succeededThere, until + 1), { fate: 'keep', why: 'its command succeeded on this chain' });
+check('fate: a status that cannot be read — kept, even past its ttl', fileFate(modCmd, '0', {} as any, until + 1).fate, 'keep');
+check('fate: a file whose hash is not its command\'s cannot be judged — kept, even failed and past its ttl', fileFate(forged, '0', failedThere, until + 1).fate, 'keep');
+check('fate: a file naming another chain — kept, even failed and past its ttl', fileFate(chain1File, '0', failedThere, until + 1).fate, 'keep');
+check('fate: an unreadable file — kept', fileFate(null, '0', undefined, until + 1).fate, 'keep');
+const KEEP: FileFate = { fate: 'keep', why: `its command can still land until ${utc(until)}` };
+const GONE: FileFate = { fate: 'supersede', why: `its command expired at ${utc(until)}` };
+check('plan: ours — untouched, with or without a file there', [planChain('ours', null), planChain('ours', GONE)], [{ do: 'untouched' }, { do: 'untouched' }]);
+check('plan: LOST with a file there — nothing written, its file moved aside out of the send glob', planChain('lost', KEEP), { do: 'lost', moveAside: true });
+check('plan: LOST with no file there — nothing written, nothing to move', planChain('lost', null), { do: 'lost', moveAside: false });
+check('plan: available with no file — one written', planChain('available', null), { do: 'write', moveAside: false });
+check('plan: available, its file failed or expired — moved aside, then a fresh one written', planChain('available', GONE), { do: 'write', moveAside: true, why: GONE.why });
+check('plan: available, its file can still land — kept, nothing regenerated', planChain('available', KEEP), { do: 'keep', why: KEEP.why });
+
+// On disk, in a throwaway directory: a file moved aside keeps every byte, leaves the send glob, never
+// overwrites another, and still proves its chain.
+const tmp = mkdtempSync(join(tmpdir(), 'bh-tools-'));
+try {
+  const name = 'chain00-deploy-free-block-history.json';
+  const body = JSON.stringify(modCmd, null, 2) + '\n';
+  writeFileSync(join(tmp, name), body);
+  const moved = supersede(tmp, name);
+  check('supersede: moved into superseded/ under its name with its hash added', moved, `superseded/chain00-deploy-free-block-history.${modCmd.hash}.json`);
+  check('supersede: out of the send glob (no .json left beside it), every byte kept', [existsSync(join(tmp, name)), readdirSync(tmp).filter((n) => n.endsWith('.json')), readFileSync(join(tmp, moved), 'utf8') === body], [false, [], true]);
+  writeFileSync(join(tmp, name), body);
+  const again = supersede(tmp, name);
+  check('supersede: the same file again never overwrites the first', [again, readFileSync(join(tmp, moved), 'utf8') === body], [`superseded/chain00-deploy-free-block-history.${modCmd.hash}.2.json`, true]);
+  const read = readDeployFiles(P, tmp);
+  check('superseded files are still read as proof material', [read.files.length, read.files.some((f) => f.file === moved), read.refused], [2, true, []]);
+  check('a superseded file still proves its chain ours', own(true, read.files, landedAs(modCmd.hash)), 'ours');
+} finally { rmSync(tmp, { recursive: true, force: true }); }
 
 console.log(fails ? `\n${fails} check(s) FAILED` : '\nall tool checks passed');
 process.exit(fails ? 1 : 0);

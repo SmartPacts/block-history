@@ -1,6 +1,6 @@
 // send-signed.ts — sign the gas payer's slot of the module commands `deploy --unsigned` wrote, check
-// every one, and only with --send submit them: all preflighted first, then all submitted back to back,
-// then each waited for.
+// every one, and only with --send submit them: all preflighted first, then all submitted at once, then
+// each waited for.
 //   npm run send-signed -- --gas-key <key.json> out/unsigned/<network-id>/*.json          check only
 //   npm run send-signed -- --gas-key <key.json> --send out/unsigned/<network-id>/*.json   sign, check, submit
 //   npm run send-signed -- [--send] <signed.json> …                                       commands already signed elsewhere
@@ -18,19 +18,21 @@
 // a body rebuilt with no signature (lib.ts: preflightRequest), whatever the file carries.
 // SEND: the maximum fee is printed first. Every command is preflighted, signed, before ANY is submitted, and
 // one refusal stops the run with nothing sent. On a chain that already carries the module, that preflight
-// refuses a module command: the module is immutable. Then all are submitted back to back, and only then
-// waited for. Once the first module lands its code is public, and a copy of it landed first on a later
-// chain makes that chain LOST (lib.ts: ownership), so the last submission follows the first within
-// seconds, not the minutes a one-at-a-time send takes. Commands that depend on one another cannot share a
-// run: each is preflighted before any lands. A command already on chain is skipped without being signed,
-// once it is confirmed to be one this run would accept (lib.ts: spentKind), so re-running after a partial
-// session is safe however long ago it was.
+// refuses a module command: the module is immutable. Then all are submitted at once, and only then waited
+// for. Once the first module lands its code is public, and a copy of it landed first on a later chain makes
+// that chain LOST (lib.ts: ownership), so no chain's submission waits on another's. A submission that fails
+// may still have reached the node, so the run then stops, with every command possibly in flight. A command
+// not mined while the run waits may still land until its creation time plus its ttl: its file must not be
+// regenerated, and the same send is simply re-run. Commands that depend on one another cannot share a run:
+// each is preflighted before any lands. A command already on chain is skipped without being signed, once it
+// is confirmed to be one this run would accept (lib.ts: spentKind), so re-running after a partial session is
+// safe however long ago it was.
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChainId, ICommand } from '@kadena/client';
 import {
   API, NETWORK_ID, NS, ROOT, GAS_PRICE, client, retrying, pollMined, errorText, chainTime,
-  signGasSlot, verifySigned, fileChain, statusDecision, relayKind, spentKind, preflightRequest,
+  signGasSlot, verifySigned, fileChain, statusDecision, relayKind, spentKind, preflightRequest, validUntil, utc,
   type Emitted, type Signed,
 } from './lib.js';
 
@@ -160,28 +162,42 @@ if (!doSend) {
     preGas.set(it, pre.gas);
     console.log(`  ✓ preflight, signed  chain ${it.chainId.padStart(2)}  gas ${pre.gas}  ${it.file}`);
   }
-  // 2. All submitted back to back; none is waited for yet.
-  let submitted = 0;
-  const before = () => (submitted ? `\n${submitted} command(s) listed above as submitted went out before it and may still be mined: wait for them, then re-run this command (those on chain are skipped).` : '');
-  for (const it of items) {
-    let requestKey = '';
-    try { requestKey = (await retrying('submit', () => client.submit(it.signed as unknown as ICommand))).requestKey; }
-    catch (e: any) { die(`${it.file}: the submit failed — ${e?.message ?? e}${before()}`); }
-    if (requestKey !== it.signed.hash) die(`${it.file}: the node returned request key ${requestKey}, not the command's hash ${it.signed.hash}${before()}`);
-    console.log(`  → submitted  chain ${it.chainId.padStart(2)}  request key ${requestKey}`);
-    submitted++;
+  // 2. All submitted at once, so a slow or retried chain holds back no other. A submission that throws, or
+  //    returns another key, may still have reached the node: then every command may be in flight.
+  const subs = await Promise.allSettled(items.map((it) => retrying('submit', () => client.submit(it.signed as unknown as ICommand))));
+  let unsure = 0;
+  items.forEach((it, i) => {
+    const s = subs[i];
+    const why = s.status === 'rejected' ? String(s.reason?.message ?? s.reason)
+      : s.value.requestKey !== it.signed.hash ? `the node returned request key ${s.value.requestKey}, not the command's hash ${it.signed.hash}` : '';
+    if (!why) { console.log(`  → submitted  chain ${it.chainId.padStart(2)}  request key ${it.signed.hash}`); return; }
+    console.log(`  ✗ SUBMIT FAILED  chain ${it.chainId.padStart(2)}  ${it.file} — ${why}. This command may still have reached the node.`);
+    unsure++;
+  });
+  if (unsure) {
+    die(`${unsure} of ${items.length} submission(s) did not come back as expected, so every command may be in flight:\n`
+      + items.map((it) => `  chain ${it.chainId.padStart(2)}  ${it.file}`).join('\n')
+      + `\nWait a few minutes, then re-run this same command: it skips what landed.`);
   }
   // 3. Each waited for and reported. One that does not land does not stop the others being reported.
   let sent = 0;
-  const failed: string[] = [];
+  const minedFailed: string[] = [], notMined: string[] = [];
   for (const it of items) {
     let r: any;
     try { r = await pollMined(it.signed.hash, it.chainId, it.file); }
-    catch (e: any) { console.log(`  ✗ NOT MINED  chain ${it.chainId.padStart(2)}  ${e?.message ?? e}`); failed.push(it.chainId); continue; }
-    if (r.result?.status !== 'success') { console.log(`  ✗ MINED BUT FAILED  chain ${it.chainId.padStart(2)}  ${it.file} — ${errorText(r)}`); failed.push(it.chainId); continue; }
+    catch {
+      const until = validUntil(it.signed.cmd);
+      console.log(`  ✗ NOT MINED  chain ${it.chainId.padStart(2)}  ${it.file} — not mined while this run waited; it may still land until ${until === null ? '(unknown)' : utc(until)}. Do NOT regenerate its file: re-run this same send later.`);
+      notMined.push(it.chainId);
+      continue;
+    }
+    if (r.result?.status !== 'success') { console.log(`  ✗ MINED BUT FAILED  chain ${it.chainId.padStart(2)}  ${it.file} — ${errorText(r)}`); minedFailed.push(it.chainId); continue; }
     console.log(`  ✓ mined  chain ${it.chainId.padStart(2)}  height ${r.metaData?.blockHeight}  gas ${r.gas} (preflight ${preGas.get(it)})  request key ${it.signed.hash}`);
     sent++;
   }
-  if (failed.length) die(`${failed.length} of ${items.length} submitted command(s) did not land (chain(s) ${failed.join(',')}); ${sent} mined, ${skipped} were already on chain. A module command that fails on its chain usually means another copy of the module landed there first: run npm run preflight, which reports a chain whose module is not ours as LOST.`);
+  const why: string[] = [];
+  if (minedFailed.length) why.push(`chain(s) ${minedFailed.join(',')} MINED BUT FAILED: another copy may have landed first; run preflight (npm run preflight), which reports a chain whose module is not ours as LOST`);
+  if (notMined.length) why.push(`chain(s) ${notMined.join(',')} NOT MINED yet: each may still land until the time shown above, so do NOT regenerate their files; re-run this same send later`);
+  if (why.length) die(`${minedFailed.length + notMined.length} of ${items.length} submitted command(s) did not land; ${sent} mined, ${skipped} were already on chain.\n${why.join('.\n')}.`);
   console.log(`\n  SENT ${sent}; ${skipped} were already on chain.`);
 }

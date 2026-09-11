@@ -9,7 +9,7 @@ import {
 import {
   genKeyPair, hash as blakeHash, signHash, verifySig, restoreKeyPairFromSecretKey, hexToBin, base64UrlDecodeArr,
 } from '@kadena/cryptography-utils';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -171,10 +171,12 @@ export async function send(s: TxSpec): Promise<Landed> {
   return sendBuilt(await buildSigned(s), s.chainId, s.label);
 }
 
-// The same for a command already built and signed, so a caller can record it before it is sent.
-export async function sendBuilt(signed: ICommand, chainId: ChainId, label: string): Promise<Landed> {
+// The same for a command already built and signed. `beforeSubmit` runs once the node's preflight has
+// passed, just before the command is submitted, so a caller can record exactly what it sends.
+export async function sendBuilt(signed: ICommand, chainId: ChainId, label: string, beforeSubmit?: () => void): Promise<Landed> {
   const pre = await retrying('preflight', () => client.local(signed, { preflight: true, signatureVerification: true }));
   if (pre.result.status !== 'success') throw new Error(`${label}: preflight FAILED: ${errorText(pre)}`);
+  beforeSubmit?.();
   const desc = await retrying('submit', () => client.submit(signed));
   const r = await pollMined(desc.requestKey, chainId, label);
   if (r.result.status !== 'success') throw new Error(`${label}: mined tx FAILED: ${errorText(r)}`);
@@ -227,12 +229,12 @@ export type Signed = { cmd: string; hash: string; sigs: { sig: string }[] };
 // rebuild reproduces it exactly and a file cannot carry any other text there.
 export function buildUnsignedGasOnly(s: {
   code: string; data: Record<string, any>; chainId: ChainId; sender: string; signerPubKey: string;
-  gasLimit: number; creationTime: number; gasPrice?: number; networkId?: string; nonce?: string;
+  gasLimit: number; creationTime: number; gasPrice?: number; networkId?: string; nonce?: string; ttl?: number;
 }): Emitted {
   let b: any = Pact.builder.execution(s.code).addSigner(s.signerPubKey, (wc: WithCap) => [wc('coin.GAS')]);
   for (const [k, v] of Object.entries(s.data)) b = b.addData(k, v);
   const tx: IUnsignedCommand = b
-    .setMeta({ chainId: s.chainId, senderAccount: s.sender, gasLimit: s.gasLimit, gasPrice: s.gasPrice ?? GAS_PRICE, ttl: 28800, creationTime: s.creationTime })
+    .setMeta({ chainId: s.chainId, senderAccount: s.sender, gasLimit: s.gasLimit, gasPrice: s.gasPrice ?? GAS_PRICE, ttl: s.ttl ?? 28800, creationTime: s.creationTime })
     .setNetworkId(s.networkId ?? NETWORK_ID)
     .setNonce(s.nonce ?? `block-history:${s.chainId}:${s.creationTime}`)
     .createTransaction();
@@ -402,13 +404,25 @@ export type ProofExpect = Pick<DeployExpect, 'networkId' | 'ns' | 'source'>;
 // The chain a deploy file can speak for, or a throw naming why it proves nothing. It is judged the way a
 // command signed elsewhere is: fileChain (its hash is its command's own, so the hash is the request key of
 // exactly this command, and the chain is the one the command names), this run's network, and relayKind's
-// module command (this checkout's exact module source, into this run's namespace). A success on chain for
-// any other command proves only that THAT command ran.
+// module command (this checkout's exact module source, into this run's namespace). Then, as signGasSlot
+// ends, the exact rebuild: the deploy's own builder, given this checkout's code and data and, from the file,
+// only what may differ between runs (gas payer, signer key, creation time, gas price, gas limit, ttl), must
+// reproduce the file's bytes, so no extra data key, continuation, verifier or signer rides along. A success
+// on chain for any other command proves only that THAT command ran.
 export function proofChain(tx: { cmd: string; hash: string }, x: ProofExpect): ChainId {
   const chainId = fileChain(tx);
-  const networkId = JSON.parse(tx.cmd).networkId;
+  const cmd = JSON.parse(tx.cmd), networkId = cmd.networkId;
   if (networkId !== x.networkId) fail('network', `the command is for ${networkId}, this run targets ${x.networkId}`);
   if (relayKind(tx.cmd, x) !== 'module') fail('proof-other', 'it is not the deploy\'s module command: its code is not this checkout\'s exact module source');
+  const m = cmd.meta ?? {};
+  let rebuilt = '';
+  try {
+    rebuilt = buildUnsignedGasOnly({
+      code: x.source, data: { ns: x.ns }, chainId, sender: m.sender, signerPubKey: cmd.signers?.[0]?.pubKey,
+      gasLimit: m.gasLimit, gasPrice: m.gasPrice, creationTime: m.creationTime, ttl: m.ttl, networkId: x.networkId,
+    }).cmd;
+  } catch { /* fields the builder cannot take: there are no bytes to match */ }
+  if (rebuilt !== tx.cmd) fail('exact', 'the command differs from the one the deploy tool writes');
   return chainId;
 }
 
@@ -432,18 +446,100 @@ export function ownership(
   return proofKeys(s.files, s.chainId, x).some((k) => s.statuses[k]?.result?.status === 'success') ? 'ours' : 'lost';
 }
 
-// The operator's deploy files for this network. `files` holds those proofChain accepts; `refused` names every
+// Where a deploy file goes when a fresh one replaces it, or when its chain is LOST: out of the send glob
+// (out/unsigned/<network-id>/*.json), and never deleted. The send reads it only when it is named.
+export const SUPERSEDED = 'superseded';
+
+// The operator's deploy files for this network: every file in the directory and in its superseded/, since a
+// file moved aside is still proof material. `files` holds those proofChain accepts; `refused` names every
 // other file there and why it proves nothing. ownership() still judges every file itself.
 export function readDeployFiles(x: ProofExpect, dir: string = DEPLOY_DIR): { files: DeployFile[]; refused: { file: string; why: string }[] } {
   const files: DeployFile[] = [], refused: { file: string; why: string }[] = [];
-  if (!existsSync(dir)) return { files, refused };
-  for (const file of readdirSync(dir).filter((n) => n.endsWith('.json')).sort()) {
-    let f: DeployFile;
-    try { const j = JSON.parse(readFileSync(join(dir, file), 'utf8')); f = { file, cmd: j?.cmd, hash: j?.hash }; }
-    catch { refused.push({ file, why: 'not a readable command file' }); continue; }
-    try { proofChain(f, x); files.push(f); } catch (e: any) { refused.push({ file, why: String(e?.message ?? e) }); }
+  for (const sub of ['', SUPERSEDED]) {
+    const d = join(dir, sub);
+    if (!existsSync(d)) continue;
+    for (const n of readdirSync(d).filter((n) => n.endsWith('.json')).sort()) {
+      const file = sub ? `${sub}/${n}` : n;
+      let f: DeployFile;
+      try { const j = JSON.parse(readFileSync(join(d, n), 'utf8')); f = { file, cmd: j?.cmd, hash: j?.hash }; }
+      catch { refused.push({ file, why: 'not a readable command file' }); continue; }
+      try { proofChain(f, x); files.push(f); } catch (e: any) { refused.push({ file, why: String(e?.message ?? e) }); }
+    }
   }
   return { files, refused };
+}
+
+// Seconds -> "2026-09-11T08:00:00Z".
+export const utc = (seconds: number) => new Date(seconds * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+// The last moment a command can land: its creation time plus its ttl, in seconds; null if it names neither.
+export function validUntil(cmdText: string): number | null {
+  let m: any;
+  try { m = JSON.parse(cmdText)?.meta; } catch { return null; }
+  return Number.isFinite(m?.creationTime) && Number.isFinite(m?.ttl) ? m.creationTime + m.ttl : null;
+}
+
+// Moves <dir>/<name> into <dir>/superseded/ under its name with its hash added, and returns the new name
+// relative to <dir>. Never over a file already there: a taken name gets .2, .3, … The bytes are copied
+// whole before the original is removed.
+export function supersede(dir: string, name: string): string {
+  const src = join(dir, name);
+  const raw = readFileSync(src, 'utf8');
+  let tag = '';
+  try { tag = String(JSON.parse(raw)?.hash ?? ''); } catch { /* unreadable: named by its bytes below */ }
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(tag)) tag = blakeHash(raw);
+  mkdirSync(join(dir, SUPERSEDED), { recursive: true });
+  const base = name.replace(/\.json$/, '');
+  for (let i = 1; ; i++) {
+    const moved = `${SUPERSEDED}/${base}.${tag}${i > 1 ? `.${i}` : ''}.json`;
+    try { copyFileSync(src, join(dir, moved), fsConstants.COPYFILE_EXCL); }
+    catch (e: any) { if (e?.code === 'EEXIST') continue; throw e; }
+    unlinkSync(src);
+    return moved;
+  }
+}
+
+export type FileFate = { fate: 'keep' | 'supersede'; why: string };
+
+// What deploy may do with the file already at a chain's path, when the module there is not ours: never
+// destroy a proof. A file is superseded only when its command can no longer land: it failed on that chain,
+// or its creation time plus its ttl is behind the chain's time `now` (seconds). One that succeeded is kept,
+// and so is anything that cannot be judged: an unreadable file, one whose hash is not its command's, one
+// naming another chain, a status that cannot be read, a command pending, or not yet sent, within its ttl.
+export function fileFate(tx: { cmd: string; hash: string } | null, chainId: ChainId, status: ICommandResult | undefined, now: number): FileFate {
+  if (!tx) return { fate: 'keep', why: 'it cannot be judged (not a readable command file)' };
+  let chain: ChainId;
+  try { chain = fileChain(tx); } catch (e: any) { return { fate: 'keep', why: `it cannot be judged (${String(e?.message ?? e)})` }; }
+  if (chain !== chainId) return { fate: 'keep', why: `it names chain ${chain}, not chain ${chainId}` };
+  if (status?.result?.status === 'success') return { fate: 'keep', why: 'its command succeeded on this chain' };
+  if (status?.result?.status === 'failure') return { fate: 'supersede', why: `its command failed on this chain (${errorText(status)})` };
+  if (status) return { fate: 'keep', why: 'its status on this chain cannot be read' };
+  const until = validUntil(tx.cmd);
+  if (until === null) return { fate: 'keep', why: 'it cannot be judged (it names no creation time and ttl)' };
+  if (until < now) return { fate: 'supersede', why: `its command expired at ${utc(until)}` };
+  return { fate: 'keep', why: `its command can still land until ${utc(until)}` };
+}
+
+// fileFate() with the network steps it needs: the file's status on its chain, and that chain's time.
+export async function fileFateOn(chainId: ChainId, tx: { cmd: string; hash: string } | null): Promise<FileFate> {
+  let judged = false;
+  try { judged = !!tx && fileChain(tx) === chainId; } catch { /* fileFate says why */ }
+  if (!judged) return fileFate(tx, chainId, undefined, NaN);
+  const status = (await retrying('status', () => client.getStatus({ requestKey: tx!.hash, chainId, networkId: NETWORK_ID })))[tx!.hash];
+  return fileFate(tx, chainId, status, Math.floor((await chainTime(chainId)).getTime() / 1000));
+}
+
+// What deploy does on one chain, from its ownership and the fate of the file at its path (null: no file).
+// Ours: untouched. LOST: no file written, and any file there moved aside, out of the send glob. Otherwise a
+// file whose command can still land is kept and nothing is regenerated; one whose command cannot is moved
+// aside, and a fresh one is written.
+export type ChainPlan = { do: 'untouched' } | { do: 'lost'; moveAside: boolean } | { do: 'keep'; why: string } | { do: 'write'; moveAside: boolean; why?: string };
+export function planChain(who: Ownership, fate: FileFate | null): ChainPlan {
+  if (who === 'ours') return { do: 'untouched' };
+  if (who === 'lost') return { do: 'lost', moveAside: fate !== null };
+  if (!fate) return { do: 'write', moveAside: false };
+  if (fate.fate === 'keep') return { do: 'keep', why: fate.why };
+  return { do: 'write', moveAside: true, why: fate.why };
 }
 
 // ownership() with the one network step it needs: the chain's status lookup of proofKeys. A lookup the node
