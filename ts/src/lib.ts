@@ -657,3 +657,71 @@ export function microsOf(iso: string): number {
   if (!m) throw new Error(`bad time ${iso}`);
   return Date.parse(m[1] + 'Z') * 1000 + Number((m[2] ?? '').padEnd(6, '0'));
 }
+
+// ---------------------------------------------------------------------------------------------
+// The feeder's two optional sending modes, both off by default: the rules for their settings, pure so
+// they are checked offline. feeder.ts does the sending.
+
+export const MAX_SUBMIT_HOSTS = 5;
+
+// BH_HOST as the extra hosts are compared with it: scheme, host and port, then any path without its
+// trailing slashes. A value that is not a URL is compared as written, less its trailing slashes.
+const baseUrl = (s: string) => { try { const u = new URL(s); return u.origin + u.pathname.replace(/\/+$/, ''); } catch { return s.trim().replace(/\/+$/, ''); } };
+
+// BH_SUBMIT_HOSTS: the extra hosts every signed attest also goes to, each reduced to its origin; [] when
+// unset or empty. Each must be a bare https://host[:port] (the send path is appended to it), listed once,
+// and not `primary` (BH_HOST), which already gets every attest; at most MAX_SUBMIT_HOSTS. A refusal names
+// the entry by its position and never repeats what it carried, which could be a password.
+export function parseSubmitHosts(spec: string | undefined, primary: string): string[] {
+  if (spec === undefined || spec.trim() === '') return [];
+  const entries = spec.split(',').map((e) => e.trim());
+  if (entries.length > MAX_SUBMIT_HOSTS) fail('hosts-count', `BH_SUBMIT_HOSTS lists ${entries.length} hosts; at most ${MAX_SUBMIT_HOSTS} are allowed`);
+  const out: string[] = [];
+  for (const [i, e] of entries.entries()) {
+    const n = `BH_SUBMIT_HOSTS entry ${i + 1}`;
+    let u: URL | undefined;
+    try { u = new URL(e); } catch { /* refused just below */ }
+    if (!u) return fail('hosts-url', `${n} is ${e === '' ? 'empty' : 'not a URL'}`);
+    if (u.protocol !== 'https:') fail('hosts-https', `${n} does not use https`);
+    if (u.username || u.password || u.pathname !== '/' || u.search || u.hash) fail('hosts-base', `${n} must be a bare https://host or https://host:port, with no user, password, path, query or fragment`);
+    if (out.includes(u.origin)) fail('hosts-duplicate', `${n} repeats ${u.origin}`);
+    if (u.origin === baseUrl(primary)) fail('hosts-primary', `${n} is BH_HOST itself (${u.origin}), which already gets every attest`);
+    out.push(u.origin);
+  }
+  return out;
+}
+
+// Where a host takes a signed command for a chain: the same Pact /send path the client posts to on BH_HOST.
+export const sendUrl = (host: string, networkId: string, chainId: ChainId) => `${host}/chainweb/0.0/${networkId}/chain/${chainId}/pact/api/v1/send`;
+
+// A Chainweb node's refusal of a command it already has. The command is then delivered there.
+export const ALREADY_KNOWN = 'Transaction already exists on chain';
+
+// One extra host's answer to one /send: 'ok' (delivered) when it returns exactly this command's request
+// key, or refuses the command as one it already has; 'err' (failed) for anything else, including a 200
+// that is not a node's answer.
+export function fanoutOutcome(status: number, body: string, requestKey: string): 'ok' | 'err' {
+  if (status >= 200 && status < 300) {
+    let keys: unknown;
+    try { keys = JSON.parse(body)?.requestKeys; } catch { return 'err'; }
+    return Array.isArray(keys) && keys.length === 1 && keys[0] === requestKey ? 'ok' : 'err';
+  }
+  return body.includes(ALREADY_KNOWN) ? 'ok' : 'err';
+}
+
+export const WAITING_MIN = 2, WAITING_MAX = 60, WAITING_JITTER = 0.2;
+
+// BH_WAITING_INTERVAL: the seconds between a chain's waiting attests, or null (off) when unset or empty.
+// Whole seconds only, WAITING_MIN to WAITING_MAX.
+export function parseWaitingInterval(spec: string | undefined): number | null {
+  if (spec === undefined || spec.trim() === '') return null;
+  const t = spec.trim();
+  if (!/^[0-9]+$/.test(t)) fail('interval-format', `BH_WAITING_INTERVAL must be a whole number of seconds, not ${JSON.stringify(spec)}`);
+  const n = Number(t);
+  if (n < WAITING_MIN || n > WAITING_MAX) fail('interval-range', `BH_WAITING_INTERVAL is ${n}; it must be ${WAITING_MIN} to ${WAITING_MAX} seconds`);
+  return n;
+}
+
+// The delay before a chain's next waiting attest, in ms: the interval ±WAITING_JITTER for `rand` uniform
+// in [0, 1), so the chains' timers drift apart instead of firing together.
+export const jitterDelay = (seconds: number, rand: number) => Math.round(seconds * 1000 * (1 + WAITING_JITTER * (2 * rand - 1)));

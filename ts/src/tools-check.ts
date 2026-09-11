@@ -10,7 +10,9 @@
 // module: ours only when one of the operator's own deploy files, rebuilt byte for byte, succeeded there,
 // whatever the hash. So is what deploy does with a file already on disk: it keeps one whose command can
 // still land, and moves one aside, never deleting it, when that command failed, expired, or its chain is
-// LOST; the moves run in a throwaway directory.
+// LOST; the moves run in a throwaway directory. So are the rules behind the feeder's two optional sending
+// modes: which BH_SUBMIT_HOSTS and BH_WAITING_INTERVAL values start it, each refusal by its own code, the
+// send URL, the jitter bounds, and how an extra host's answer counts.
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -21,6 +23,7 @@ import {
   buildUnsignedGasOnly, signGasSlot, verifySigned, unsignedBody, commandKind,
   fileChain, statusDecision, relayKind, spentKind, preflightRequest, errorText, proofChain, ownership,
   readDeployFiles, supersede, fileFate, planChain, validUntil, utc,
+  parseSubmitHosts, sendUrl, fanoutOutcome, ALREADY_KNOWN, parseWaitingInterval, jitterDelay,
   type Emitted, type DeployExpect, type FileFate,
 } from './lib.js';
 
@@ -286,6 +289,56 @@ try {
   check('superseded files are still read as proof material', [read.files.length, read.files.some((f) => f.file === moved), read.refused], [2, true, []]);
   check('a superseded file still proves its chain ours', own(true, read.files, landedAs(modCmd.hash)), 'ours');
 } finally { rmSync(tmp, { recursive: true, force: true }); }
+
+// ---- the feeder's optional sending modes: the rules it starts and sends by (no network here) ------------
+const PRIMARY = 'https://api.chainweb.com';
+const hosts = (spec: string | undefined, primary = PRIMARY) => outcome(() => parseSubmitHosts(spec, primary));
+const five = ['a', 'b', 'c', 'd', 'e'].map((x) => `https://${x}.example`);
+check('hosts: unset or empty means no extra host', [hosts(undefined), hosts(''), hosts('  ')], [[], [], []]);
+check('hosts: an https list is accepted, trimmed, each reduced to its origin', hosts(' https://api.chainweb-community.org , https://chainweb.chaddex.com/'), ['https://api.chainweb-community.org', 'https://chainweb.chaddex.com']);
+check('hosts: five hosts are accepted', hosts(five.join(',')), five);
+check('hosts: a port is kept', hosts('https://a.example:8443'), ['https://a.example:8443']);
+refuses('hosts: an http entry', () => parseSubmitHosts('https://a.example,http://b.example', PRIMARY), 'hosts-https');
+refuses('hosts: the same host twice', () => parseSubmitHosts('https://a.example,https://a.example', PRIMARY), 'hosts-duplicate');
+refuses('hosts: the same host twice, written differently (case, default port, trailing slash)', () => parseSubmitHosts('https://a.example,https://A.EXAMPLE:443/', PRIMARY), 'hosts-duplicate');
+refuses('hosts: BH_HOST itself', () => parseSubmitHosts(`https://a.example,${PRIMARY}`, PRIMARY), 'hosts-primary');
+refuses('hosts: BH_HOST itself, written differently', () => parseSubmitHosts('https://API.chainweb.com', `${PRIMARY}/`), 'hosts-primary');
+refuses('hosts: six hosts', () => parseSubmitHosts([...five, 'https://f.example'].join(','), PRIMARY), 'hosts-count');
+refuses('hosts: an entry that is not a URL', () => parseSubmitHosts('https://a.example,not a url', PRIMARY), 'hosts-url');
+refuses('hosts: an empty entry (a stray comma)', () => parseSubmitHosts('https://a.example,', PRIMARY), 'hosts-url');
+refuses('hosts: a user and password', () => parseSubmitHosts('https://user:secret@a.example', PRIMARY), 'hosts-base');
+refuses('hosts: a path (the send path is appended to the origin)', () => parseSubmitHosts('https://a.example/chainweb', PRIMARY), 'hosts-base');
+refuses('hosts: a query', () => parseSubmitHosts('https://a.example/?key=1', PRIMARY), 'hosts-base');
+// What a refusal says, or 'accepted': an entry that got through cannot pass for a refusal that stayed quiet.
+const said = (f: () => unknown) => { try { f(); return 'accepted'; } catch (e: any) { return String(e?.message ?? e); } };
+check('hosts: a refusal never repeats what an entry carried (a password, for one)',
+  ['http://user:secret@a.example', 'https://user:secret@a.example', 'secret'].map((s) => { const m = said(() => parseSubmitHosts(s, PRIMARY)); return m !== 'accepted' && !m.includes('secret'); }),
+  [true, true, true]);
+check('send URL: the Pact /send for the chain, on that host', sendUrl('https://api.chainweb-community.org', 'mainnet01', '7'), 'https://api.chainweb-community.org/chainweb/0.0/mainnet01/chain/7/pact/api/v1/send');
+
+const RK = modCmd.hash;
+check('fan-out: the node\'s own words for a command it already has', ALREADY_KNOWN, 'Transaction already exists on chain');
+check('fan-out: the host returns this command\'s request key — delivered', fanoutOutcome(200, JSON.stringify({ requestKeys: [RK] }), RK), 'ok');
+check('fan-out: the host already has the command — delivered', fanoutOutcome(400, `One or more transactions were invalid: Transaction ${RK} at index 0 failed with: ${ALREADY_KNOWN}`, RK), 'ok');
+check('fan-out: any other refusal — failed', fanoutOutcome(400, `One or more transactions were invalid: Transaction ${RK} at index 0 failed with: Transaction time-to-live is expired`, RK), 'err');
+check('fan-out: a 200 that is not a node\'s answer — failed', fanoutOutcome(200, '<html>ok</html>', RK), 'err');
+check('fan-out: a 200 naming another request key — failed', fanoutOutcome(200, JSON.stringify({ requestKeys: ['another'] }), RK), 'err');
+check('fan-out: a server error — failed', fanoutOutcome(502, 'Bad Gateway', RK), 'err');
+
+const interval = (spec: string | undefined) => outcome(() => parseWaitingInterval(spec));
+check('interval: unset or empty means off', [interval(undefined), interval(''), interval(' ')], [null, null, null]);
+check('interval: 2 and 60, the ends of the range, are accepted', [interval('2'), interval('60')], [2, 60]);
+refuses('interval: 1, below the range', () => parseWaitingInterval('1'), 'interval-range');
+refuses('interval: 61, above the range', () => parseWaitingInterval('61'), 'interval-range');
+refuses('interval: 0', () => parseWaitingInterval('0'), 'interval-range');
+refuses('interval: a fraction', () => parseWaitingInterval('2.5'), 'interval-format');
+refuses('interval: an exponent', () => parseWaitingInterval('1e1'), 'interval-format');
+refuses('interval: a negative number', () => parseWaitingInterval('-5'), 'interval-format');
+refuses('interval: a word', () => parseWaitingInterval('ten'), 'interval-format');
+check('jitter: the delay runs from 20 % under the interval to 20 % over it', [jitterDelay(10, 0), jitterDelay(10, 0.5), jitterDelay(10, 1)], [8000, 10000, 12000]);
+const draws = Array.from({ length: 10_000 }, () => jitterDelay(2, Math.random()));
+const [lo, hi] = [Math.min(...draws), Math.max(...draws)];
+check('jitter: 10,000 random delays at the 2 s floor stay within 1.6-2.4 s, and spread across it', [lo >= 1600, hi <= 2400, lo < 1700, hi > 2300], [true, true, true, true]);
 
 console.log(fails ? `\n${fails} check(s) FAILED` : '\nall tool checks passed');
 process.exit(fails ? 1 : 0);
