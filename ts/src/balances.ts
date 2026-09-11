@@ -3,8 +3,8 @@
 //   npm run balances -- k:<public key>
 //
 // Runway uses the MAINNET block rate (2,878 blocks per chain per day, measured over 40,000
-// consecutive blocks) and 205 gas per recorded block (measured on devnet). A redundant feeder's
-// losing attests cost ~150 gas, so for a second feeder this errs on the long side.
+// consecutive blocks) and 191 gas per recorded block (measured on a devnet node, 271 mined records). A
+// redundant feeder's losing attests cost less, so for a second feeder this errs on the long side.
 //
 // "unfunded" means the chain answered and the account holds nothing there. A chain that could not
 // be READ is reported as an error, never as zero — an unreachable node must not look like an
@@ -13,7 +13,7 @@ import type { ChainId } from '@kadena/client';
 import { API, NETWORK_ID, GAS_PRICE, parseChains, local } from './lib.js';
 
 const BLOCKS_PER_DAY = 2878;
-const GAS_PER_ATTEST = 205;
+const GAS_PER_ATTEST = 191;
 const PER_DAY = BLOCKS_PER_DAY * GAS_PER_ATTEST * GAS_PRICE;
 
 const acct = process.argv[2];

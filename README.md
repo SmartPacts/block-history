@@ -81,11 +81,43 @@ Each release lists its commit, the module hash and the sha256 of the module sour
 - The hash proves the code, not the starting state: the transaction that deploys a module can also
   write to its tables. So check each chain's deploy transaction: its request key succeeded on that
   chain, and its command is exactly the published module source with `{"ns":"free"}` in its data,
-  and nothing else. The 20 request keys are listed here once the module is deployed.
+  and nothing else. The 20 deploy transactions are listed below.
 - A keyset named `free.block-history-backfill` exists on all 20 chains. An earlier deploy plan, which
   included a trusted backfill, defined it on 2026-09-11; that plan was dropped before the module was
   deployed. The published module does not reference the keyset, and the keyset has no power over
   the record.
+
+### The deploy transactions — mainnet01, 2026-09-11
+
+Each chain's module came from exactly one transaction: the published module file with `{"ns":"free"}`,
+signed only by the gas payer and only for gas, at 4,223 gas. Its only event is that gas payment.
+
+| chain | block height | request key |
+|---|---|---|
+| 0 | 7218970 | `tNsPbLy0Zd4ZvtndPZX1XD9m20byWCKrQLsYO4Q0chY` |
+| 1 | 7218970 | `2hus9by7T1fboPxBeyQxJY7nSKPaQ3imWOZxuHAD9XU` |
+| 2 | 7218970 | `G9clm_pWJD3jZxLo1HjoV9UikcwvaZNDErrRQ7yDN0Q` |
+| 3 | 7218968 | `Q1CXpFhUn6z6ECTuamEMrTfbb1IEaDYFm7roJeHkDtM` |
+| 4 | 7218970 | `eGDBDykveo2dqt0bO8FjWUehfuxB_0tVOjVG-EDGIuQ` |
+| 5 | 7218969 | `5GVweuOJgVaWJhWTF_4I-ySpslFHyXywckvQv5LUvjE` |
+| 6 | 7218969 | `J1QmbCNVcaMAYNjmT6U8_IJ2nYQO01s6mxU3Q7qxH9Q` |
+| 7 | 7218970 | `kCcfMPMEUjBLhrJcqhktRGVL8lHrJFDUvhfbox8G3U8` |
+| 8 | 7218969 | `EiJVFvlLFc8BUg9uCLe1-FlKyoflrvgLjdVKLOIOdNw` |
+| 9 | 7218971 | `Z9MnFWDsZqEQg4mgHRGkW1QSy4JEFDnFs0zikEzHNoA` |
+| 10 | 7218970 | `iWx2I8-z_RUq7o8ZwXToTyqfJWS9y5md_nicaOvRNvA` |
+| 11 | 7218970 | `I2_Qa3DRjFNEKWj8B_SmwVE9A60TWE7ZA0a-hd0MP-s` |
+| 12 | 7218969 | `wpCdpZeFyz92_PPnYnXXyiQ9fSb7tGhzaH5ZugN1JkY` |
+| 13 | 7218968 | `E_6g-njXC8h0t2I8fc9olimHj3F4V1zV0wop1lmZLkQ` |
+| 14 | 7218969 | `dnQ2wfRLpiwgP7JlzBmwrcoiP-Gw2_KmlUFuLK-hbIA` |
+| 15 | 7218970 | `59wjQ4aTvh608gXivqAYKo3gUhSzTT9caUcwtMw2_Bs` |
+| 16 | 7218970 | `GdAtlkrizWekCrKi3Dlrw2pl6W1d8fX8nYGKcEX4yq8` |
+| 17 | 7218970 | `XyKdG6T1KbjbWOK93evk4Ec0CxNWYXiqy2oCTxDZSDo` |
+| 18 | 7218970 | `W14V-SpVLCqYIe_48WNtG0HE5LXLP3c7izUv8n97coc` |
+| 19 | 7218970 | `0ZTdv33jBnpYPqwmiltIcqICHICF_uC_r4cEbKKO8fw` |
+
+The operator checks ownership with `npm run preflight` from a checkout of the release tag, beside the
+deploy files it wrote: the proof compares each file with that tag's exact module source. Anyone can
+check the same facts from the request keys above.
 
 ## Evidence
 

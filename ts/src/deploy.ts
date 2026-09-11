@@ -76,7 +76,8 @@ const DIRECT_TTL = 1800;
 function record(c: ChainId, tx: { cmd: string; hash: string; sigs: unknown[] }): string {
   mkdirSync(DEPLOY_DIR, { recursive: true });
   const p = unsignedPath(c);
-  writeFileSync(p, JSON.stringify(tx, null, 2) + '\n');
+  // Never over a file: the plan has emptied this path, and a file that appeared since (another run) is proof.
+  writeFileSync(p, JSON.stringify(tx, null, 2) + '\n', { flag: 'wx' });
   return p;
 }
 const readJson = (p: string): any => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } };

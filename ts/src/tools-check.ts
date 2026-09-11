@@ -11,6 +11,7 @@
 // whatever the hash. So is what deploy does with a file already on disk: it keeps one whose command can
 // still land, and moves one aside, never deleting it, when that command failed, expired, or its chain is
 // LOST; the moves run in a throwaway directory.
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -66,6 +67,16 @@ const modCmd = buildUnsignedGasOnly({
   chainId: '0', sender: `k:${kp.publicKey}`, signerPubKey: kp.publicKey, creationTime: T, gasPrice: 1e-8, networkId: NET,
   code: SRC, data: { ns: 'free' }, gasLimit: 120000,
 });
+// Frozen bytes. The ownership proof (proofChain) rebuilds every deploy file with this builder from the module
+// file, so a builder whose output drifted (a dependency bump) or a module file changed by even a comment would
+// make preflight call every deployed chain LOST. Both are pinned: such a change fails here before it ships.
+check('the builder\'s bytes for fixed inputs are unchanged', buildUnsignedGasOnly({
+  chainId: '0', sender: `k:${K('a')}`, signerPubKey: K('a'), creationTime: T, gasPrice: 1e-8, networkId: 'mainnet01',
+  code: '(+ 1 2)', data: { ns: 'free' }, gasLimit: 120000,
+}).hash, '--P5XqExRizdwrm_5Hn_g39KSRgZb5OcZoPT2oqB13A');
+check('the module file is byte for byte the deployed release', createHash('sha256').update(SRC).digest('hex'),
+  '6102283fd93f7d38130f5ec0cc7a44e3b7bf625d01676ddf43aa7f77ac9e4d3a');
+
 // Change ONE thing and re-hash, so the hash check passes and the guard under test is what refuses.
 const edit = (t: Emitted, fn: (c: any) => void): Emitted => {
   const c = JSON.parse(t.cmd);
