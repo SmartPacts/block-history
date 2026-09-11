@@ -149,8 +149,8 @@ check the same facts from the request keys above.
 | Coverage in the feeder's active window | **99.875 %**: 4,000 heights, 5 gaps, 0 mismatches (oracle CONSISTENT) |
 | Mainnet header stream (read-only, 240 s, public proxy) | all 20 chains on one connection, 167 events, 0.70 blocks/s network-wide, 0 unparseable |
 
-One feeder burns ≈0.0055 KDA per chain per day: 0.5 KDA per chain (10 KDA total) is ≈91 days,
-and a year on all 20 chains is ≈40 KDA. The deploy itself is ≈0.0008 KDA in total.
+On mainnet one feeder burns ≈0.0060 KDA per chain per day (about 208 gas per record): 0.5 KDA per
+chain (10 KDA total) is ≈83 days, and a year on all 20 chains is ≈44 KDA. The deploy itself is ≈0.0008 KDA in total.
 
 ### Deploy-ceremony rehearsal
 - Rehearsed end to end on a fresh devnet, from a fresh clone, under mainnet's own namespace:
