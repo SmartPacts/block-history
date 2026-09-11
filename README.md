@@ -14,30 +14,32 @@ block all describe the **previous** one: at height N, `block-height` = N,
 next block returned block-height 7208926 and that exact hash — and microsecond-exact on devnet.
 
 So a transaction mined in block N can write a complete, **unforgeable** record of block N−1 from
-values the engine handed it. That window is one block wide. Nothing older can ever be proven
-in-contract: the block hash is a SHA-512/256 Merkle root (`chainweb-node
-src/Chainweb/MerkleUniverse.hs:56`), Pact 5 has no SHA-2 native, and `verify-spv` supports only
-`TXOUT`. Older blocks are therefore a **trusted** backfill, kept in a separate table.
+values the engine handed it. That window is one block wide, and writing it down is all this
+module does. Nothing older can be proven in-contract: the block hash is a SHA-512/256 Merkle root
+(`chainweb-node src/Chainweb/MerkleUniverse.hs:56`), Pact 5 has no SHA-2 native, and `verify-spv`
+supports only `TXOUT`. So the record holds only what was witnessed. Blocks before its first
+`attest`, and blocks no recorder attested, are absent, and nothing in the module can add them.
 
 ## The module — `pact/modules/block-history.pact`
 
 | Function | Who | What |
 |---|---|---|
-| `attest` | anyone, no arguments | records block N−1 from `(chain-data)`; duplicate = cheap no-op |
-| `backfill rows` | backfill keyset, window open | records older blocks into `backfilled`; refuses the frontier, malformed hashes, attested heights, conflicting re-sends; same-hash re-send is skipped |
-| `close-backfill` | backfill keyset | closes the window forever (state flag; no reopen exists) |
-| `get-attested h` / `hash-of h` / `time-of h` | anyone | the engine-attested record; **aborts** if absent — settle money on these |
-| `get-backfilled h` | anyone | the trusted record; aborts if absent |
-| `get-block h` | anyone | either, tagged `source: "attested" \| "backfilled"`; aborts if neither |
-| `has-attested h` / `has-backfilled h` / `has-block h` | anyone | gap detection, never abort |
+| `attest` | anyone, no arguments | records block N−1 from `(chain-data)`; a duplicate is a cheap no-op |
+| `get-attested h` / `hash-of h` / `time-of h` | anyone | the record of a height; **aborts** if it was never attested. Settle on these |
+| `has-attested h` | anyone | gap detection; never aborts for a height in range |
 | `latest` | anyone | highest attested `{height, hash, time}`; height −1 before the first |
-| `backfill-status` | anyone | `{open, closed-at}` |
 | `chain` | anyone | this instance's chain id |
-| `key h`, `valid-hash s` | pure | 12-digit zero-padded key; 43-char base64url shape check |
+| `key h` | pure | the 12-digit zero-padded row key |
 
-Invariants, each pinned by a test that a generated mutant turns red (`pact/tests/run.sh`):
-a height lives in at most one table; an attested row is never overwritten; a backfilled row is
-never served as attested; the module cannot be upgraded (`GOVERNANCE` is `enforce false`).
+`attest` is the only function that writes. It takes no arguments, so a caller decides only
+whether a row is written, never what it says.
+
+Each invariant is pinned by a test that a generated mutant turns red (`pact/tests/run.sh`):
+- every value comes from `(chain-data)`, and `attest` takes no arguments;
+- a recorded row is never rewritten, and a duplicate never aborts;
+- no function but `attest` writes a row;
+- the module cannot be upgraded and its tables cannot be written from outside (`GOVERNANCE` is
+  `enforce false`).
 
 Settle on `hash` and on heights. `time` is the block's miner-stamped creation time — exact to the
 microsecond on chain, but metadata. The value a row will hold is public one block before it is
@@ -48,10 +50,10 @@ written, so this is a provenance record, not a randomness beacon.
 Each chain has its own instance, so a call reads the history of the chain it runs on.
 
 ```pact
-(free.block-history.hash-of 7208925)     ; the attested hash; aborts unless attested
-(free.block-history.has-block 7208925)   ; true if either table holds the height; never aborts
-(free.block-history.get-block 7208925)   ; the record from either table, with its `source`
-(free.block-history.latest)              ; the highest attested height
+(free.block-history.hash-of 7208925)       ; the attested hash; aborts unless attested
+(free.block-history.has-attested 7208925)  ; true if the height was recorded; never aborts
+(free.block-history.get-attested 7208925)  ; {hash, time, by}; aborts unless attested
+(free.block-history.latest)                ; the highest attested height
 ```
 
 ## Verify the deployed module
@@ -60,52 +62,65 @@ Each release lists its commit, the module hash and the sha256 of the module sour
 
 - The module hash is computed by the engine, excludes comments, and is the same on all 20 chains.
   The expected mainnet hash, computed by mainnet's own engine in a read-only dry run, is
-  `0QAb21uNo_4x2OV1YbOvR3ax-ta8kKZi8hzoY97GCKI`.
+  `gV_Txq3_1nvxK7zgwJM8ZoFBunBYpuTmHaClyF9G4kU`.
 - `(describe-module "free.block-history")` on any chain returns that `hash`, and a `code` field
-  holding the source from `(module` to its closing parenthesis — compare it with the file.
+  holding the source from `(module` to its closing parenthesis. Compare it with the file.
 - `npm run preflight` (read-only) prints the hash every chain reports.
 - The hash proves the code, not the starting state: the transaction that deploys a module can also
   write to its tables. So check that each chain's deploy transaction carries exactly the published
   file and nothing else. The request keys of the 20 deploy transactions are listed here once the
   module is deployed.
+- A keyset named `free.block-history-backfill` exists on all 20 chains. An earlier deploy plan, which
+  included a trusted backfill, defined it on 2026-09-11; that plan was dropped before the module was
+  deployed. The published module does not reference the keyset, and the keyset has no power over
+  the record.
 
 ## Evidence
 
-- REPL: `pact/tests/run.sh` — static gate, every negative names its error, the suites (lifecycle,
-  branch-complete negatives, vision pins, gas, and `namespace-claim.repl` — the keyset facts the
-  two-pass deploy rests on), the frozen fixture refused for the stated reason, generated mutants
-  each turning `vision-pin.repl` RED, and a DML inventory (one `insert` per record table, no `update`).
-- Node: `ts/src/devnet-negatives.ts` re-proves every refusal by preflight on a live node, in
-  both window states, with positive controls.
-- Differential: `ts/src/oracle.ts` walks the node's canonical headers back from the cut and
+- **REPL:** `pact/tests/run.sh` runs:
+  - the static gate, with every negative naming its error;
+  - the suites: lifecycle, branch-complete negatives, vision pins, gas, and `deploy.repl` (the module
+    deploys into an open namespace with no keyset and no signature);
+  - the frozen fixture, refused for the stated reason, plus a control that loads it against open
+    governance;
+  - generated mutants, each turning `vision-pin.repl` RED;
+  - a DML inventory with its own control: `attest`'s insert into `attested` and its `latest` write,
+    and nothing else.
+- **Node:** `ts/src/devnet-negatives.ts` re-proves on a live node, by preflight, the refusals a node
+  can show: a read of a missing height, an external table write, and taking module admin. It also
+  runs a positive control, an `attest` that goes through.
+- **Differential:** `ts/src/oracle.ts` walks the node's canonical headers back from the cut and
   compares hash and microsecond time for every height. Numbers below.
-- CI runs the suite, the typecheck and tool self-checks, shellcheck, and a leak scan on every push.
+- **CI** runs the suite, the typecheck and tool self-checks, shellcheck, and a leak scan on every
+  push.
 
 ### Measured on devnet (`recap-development`, chainweb-node 3.2.1, 20 chains, ~0.85 blocks/s/chain)
 | Item | Value |
 |---|---|
-| Module hash (identical on all 20 chains) | `0QAb21uNo_4x2OV1YbOvR3ax-ta8kKZi8hzoY97GCKI` |
-| Deploy gas per chain | 10,824 |
-| `attest` gas (record / duplicate no-op) | 205 / ~150 (sampled 180 mined, 0 failed) |
-| `backfill` gas, 500-row batch | 48,213 (≈96 per row) |
-| `close-backfill` gas | 119 |
-| Feeder soak, 5 min, 20 chains | 4,304 events, 4,304 submitted, 0 submit errors, 0 reconnects |
-| Event→submit latency | p50 151 ms, p90 387 ms, p99 2.2 s |
-| Coverage in the feeder's active window (4,260 heights) | **99.30 %**, 30 gaps, 0 mismatches |
-| Chain 2 end to end, heights 0..1103 (892 backfilled + 210 attested) | 99.82 %, 2 gaps, 0 mismatches |
-| Projected mainnet gas, all 20 chains, one feeder | ≈42 KDA/year at 205 gas × 1e-8 |
+| Module hash (identical on all 20 chains) | `gV_Txq3_1nvxK7zgwJM8ZoFBunBYpuTmHaClyF9G4kU` |
+| Deploy gas per chain | 4,339 |
+| `attest` gas on a node | 204 on average over 279 sampled mined transactions, 0 failed |
+| `attest` in the REPL gas model (record / duplicate no-op) | 91 / 15 |
+| Feeder soak, 6 min, 20 chains | 6,560 events, 6,560 submitted, 0 submit errors, 0 reconnects |
+| Coverage in the feeder's active window | **99.80 %**: 4,000 heights, 8 gaps, 0 mismatches (oracle CONSISTENT) |
 | Mainnet header stream (read-only, 240 s, public proxy) | all 20 chains on one connection, 167 events, 0.70 blocks/s network-wide, 0 unparseable |
 
 One feeder burns ≈0.0059 KDA per chain per day: 0.5 KDA per chain (10 KDA total) is ≈84 days,
-and a year on all 20 chains is ≈43 KDA. The deploy itself is ≈0.0026 KDA in total.
+and a year on all 20 chains is ≈43 KDA. The deploy itself is ≈0.0009 KDA in total.
 
 ### Deploy-ceremony rehearsal
-- Rehearsed end to end on a fresh devnet with a real 2-of-3 backfill keyset: 20 chains, one hash,
-  preflight GO, feeder 99.41 % coverage, oracle CONSISTENT (0 mismatches).
-- Two deploy bugs found and fixed by that rehearsal: the unsigned flow emitted the module
-  command without confirming the keyset had landed (in an open namespace a stranger could then
-  claim the keyset and own backfill forever), and it named the local devnet key as signer instead
-  of the gas payer, making every emitted file unsignable.
+- Rehearsed end to end on a fresh devnet, from a fresh clone, under mainnet's own namespace:
+  21 of 21 checks.
+  - The preflight dry run matched the mainnet hash, and all 20 chains deployed with that one hash.
+  - Every refusal held: a secret on the command line, a key file others can read, a duplicate
+    file, an altered file.
+  - An unsigned check-only pass sent nothing signed.
+  - Files already on chain were skipped before signing, and refused when judged for another
+    namespace.
+  - A second pass had nothing left to do, and a repeated send sent nothing.
+  - The stored code equals the file and there are no rows; no key file was opened at any point.
+- An earlier rehearsal found a deploy bug, since fixed: the unsigned flow named the local devnet
+  key as signer instead of the gas payer, which made every emitted file unsignable.
 
 ### Server provisioning rehearsal — `ts/deploy/provision-droplet.sh`
 Rehearsed in clean Ubuntu 24.04 containers, talking to mainnet read-only. A container has no
@@ -120,25 +135,16 @@ systemd, firewall or swap, so those steps are skipped there; this table says wha
 | Node | v24.21.0, pinned by sha256 read in full from nodejs.org |
 
 Exercised only on a real droplet: ufw, swap, `systemd-run` as the service user under the system
-manager, and the ssh reload. Each stops loudly if it fails. Three bugs were found by rehearsing
-and fixed: the SSH hardening file was silently overridden by cloud-init (sshd keeps the FIRST
-value it reads); its verification — first written as `sshd -T | grep -q` under pipefail —
-reported "still ON" for a hardened host (SIGPIPE); and step 2 called apt-get directly, so a fresh
-droplet's own first-minutes apt jobs stopped it on "Could not get lock". `-o DPkg::Lock::Timeout`
-covers the install lock but NOT the package-list lock, so step 2 retries while any apt lock is
-held and reports any other failure at once.
+manager, and the ssh reload. Each stops loudly if it fails.
 
-### Backfill sizing (from live mainnet heights)
-Mainnet sum over 20 chains ≈ 144.3M blocks. `backfill` costs ≈96 gas/row, 500 rows/tx, ≈1,565 B/row.
-| Scope | Rows | Transactions | Gas cost | Permanent per node |
-|---|---|---|---|---|
-| Full genesis, 20 chains | 144.3M | 288,569 | ≈138 KDA | ≈226 GB |
-| Chain 2 only, full | 7.2M | 14,428 | ≈7 KDA | ≈11 GB |
-| Last 30 days, 20 chains | 1.7M | 3,456 | ≈1.7 KDA | ≈2.7 GB |
-
-Full genesis is 8-80 h of continuous submission and ≈7x the record's own yearly growth, as a
-one-off. Every backfill transaction needs 2 of the 3 backfill keys, so the scope decides how many
-signatures the run takes.
+Three bugs were found by rehearsing and fixed:
+- the SSH hardening file was silently overridden by cloud-init, because sshd keeps the FIRST value
+  it reads;
+- its verification, first written as `sshd -T | grep -q` under pipefail, reported "still ON" for a
+  hardened host (SIGPIPE);
+- step 2 called apt-get directly, so a fresh droplet's own first-minutes apt jobs stopped it on
+  "Could not get lock". `-o DPkg::Lock::Timeout` covers the install lock but NOT the package-list
+  lock, so step 2 now retries while any apt lock is held and reports any other failure at once.
 
 ## Operate — `ts/`
 
@@ -150,25 +156,23 @@ npm run stream-check -- --seconds 240   # read-only: is the node's header stream
 npm run balances -- k:<account>   # read-only: KDA per chain and feeder runway; unreachable ≠ zero
 npm run feeder                    # one process, all chains, SSE-driven; --duration N for a soak
 npm run oracle -- --last 600      # CONSISTENT / FAIL, coverage per chain
-npm run backfill -- --chain 2 --from 0 --to 12000 --dry-run    # plan; drop --dry-run to write
-BH_CONFIRM_CLOSE=2 npm run backfill -- --chain 2 --close        # one-way
 npm run devnet-negatives -- --chain 2
 ```
 
 The feeder supplies liveness, not data. It listens to the node's `/header/updates` stream (all
 20 chains on one connection), signs an `attest` per new block anchored to that block's own
 creation time, and submits with a tight gas limit (400). Coverage is a reaction-latency
-problem: measured 99.3 % on a devnet running ~25× mainnet's block rate.
+problem.
 
-Sequence for a network: **deploy → run the feeder → backfill once (history plus the gaps the
-feeder actually lost) → close → run the oracle forever.** Closing is the only one-way door.
+Sequence for a network: **deploy → run the feeder → run the oracle forever.** There is nothing to
+close and nothing to fill in later.
 
 ### Run your own recorder
 
 `attest` is permissionless and idempotent, so anyone can run the feeder with their own funded
 account, and recorders never conflict: a block is lost only when every recorder misses it. A
-recorder cannot corrupt the record — `attest` takes no arguments and writes only what the engine
-supplies — so the worst case for a leaked feeder key is its own drained gas balance. Give the
+recorder cannot corrupt the record, because `attest` takes no arguments and writes only what the
+engine supplies. So the worst case for a leaked feeder key is its own drained gas balance. Give the
 feeder an account of its own that holds only gas and authorises nothing else.
 
 ### Run the feeder on a server
@@ -181,7 +185,7 @@ One small always-on machine with a public IPv4 address. Measured requirements:
   reacts sooner.
 - **On DigitalOcean, a Bundled plan, not v5.** A v5 droplet bills its public IPv4 address
   separately and has no monthly usage cap; a Bundled plan includes the IPv4 address and caps
-  billing at 672 hours a month. The feeder needs IPv4 — see the next point.
+  billing at 672 hours a month. The feeder needs IPv4 (see the next point).
 - **The node is IPv4-only** (no AAAA record), so no IPv6-only plan can reach it. AWS is roughly
   double the alternatives once its public-IPv4 charge is counted.
 - **Not GitHub Actions:** 6 h job cap, 5 min minimum schedule, scheduled workflows disabled after
@@ -198,17 +202,23 @@ curl -fsSLo provision-droplet.sh \
 bash provision-droplet.sh <commit>
 ```
 
-It pins Node by sha256; clones this repository and checks out exactly `<commit>`, refusing
-anything else (full commit id, fsck, clean tree, and the script compares itself byte-for-byte to
-its own copy inside that commit); leaves the code owned by root and only readable by an
-unprivileged `blockhistory` user; generates the feeder key **on the droplet** (0600, never
-printed, never regenerated on a re-run); sets the firewall to inbound SSH only; turns off
-password SSH only when a key is installed, and checks the setting sshd will actually use with
-`sshd -T`; enables unattended security upgrades and log rotation; installs the systemd unit
-**without enabling it**; and proves the droplet sees every chain's block stream under the
-service's own sandbox. It ends by printing the feeder account to fund. It is safe to re-run.
-`BH_REPO` points it at another git source (a local path or a bundle), which is how it is
-rehearsed.
+What it does:
+- pins Node by sha256;
+- clones this repository and checks out exactly `<commit>`, refusing anything else: a full commit
+  id, fsck, a clean tree, and the script compares itself byte for byte to its own copy inside that
+  commit;
+- leaves the code owned by root and only readable by an unprivileged `blockhistory` user;
+- generates the feeder key **on the droplet** (0600, never printed, never regenerated on a re-run);
+- sets the firewall to inbound SSH only;
+- turns off password SSH only when a key is installed, and checks the setting sshd will actually use
+  with `sshd -T`;
+- enables unattended security upgrades and log rotation;
+- installs the systemd unit **without enabling it**;
+- proves the droplet sees every chain's block stream under the service's own sandbox;
+- ends by printing the feeder account to fund.
+
+It is safe to re-run. `BH_REPO` points it at another git source (a local path or a bundle), which is
+how it is rehearsed.
 
 Enabling the service is the step that sends mainnet transactions:
 
@@ -222,23 +232,19 @@ Five failed starts in 30 minutes make systemd stop trying rather than hammer the
 with `systemctl reset-failed block-history-feeder`. `npm run keygen -- <path>` makes a key file and
 refuses to overwrite one.
 
-### Deploying to a network — two passes
+### Deploying to a network — one pass
 
-In `free`, the user guard is `ns.success`, so every name there is first-come and **claiming an
-unclaimed name needs no signature at all** (proven in the REPL: `define-keyset` succeeds under
-`env-sigs []`). Rotating a claimed name does require the current keys (1-of-3 refused, 2-of-3
-accepted). So whoever claims `free.block-history-backfill` on a chain owns backfill there
-**forever**, because the module can never be upgraded.
-
-**That is why the deploy is two passes, and why the tool refuses to shortcut it.** The module is
-never emitted or sent for a chain whose keyset is not already on chain with the intended keys.
+In `free`, the user guard is `ns.success`, so every name there is first-come, and a module's first
+deploy needs no signature except the gas payer's. The module references no keyset, so there is
+nothing to claim first. One transaction per chain carries the module source, with `{"ns": BH_NS}`
+in its data. `npm run preflight` reports a chain whose name is held by a different module as LOST.
 
 ```
 # 0. READ-ONLY readiness. Sends nothing. Exit 0 = GO, 1 = not ready, 2 = a name is LOST.
 #    The decisive check runs the real module source on the target engine via /local.
 npm run preflight
 
-# 1. FIRST PASS: keyset commands only, one per chain, into ts/out/unsigned/<network-id>/
+# 1. One module command per chain, into ts/out/unsigned/<network-id>/
 #    (<network-id> is BH_NETWORK_ID, e.g. mainnet01)
 npm run deploy -- --unsigned
 
@@ -246,40 +252,34 @@ npm run deploy -- --unsigned
 #    is sent — then send them one by one, and confirm they landed
 npm run send-signed -- --gas-key <gas-key.json> out/unsigned/<network-id>/*.json
 npm run send-signed -- --gas-key <gas-key.json> --send out/unsigned/<network-id>/*.json
-npm run preflight                     # keyset column must read "ours ✓" on every chain
 
-# 3. SECOND PASS: now the module commands are written; sign and send them the same way
-npm run deploy -- --unsigned
-npm run send-signed -- --gas-key <gas-key.json> out/unsigned/<network-id>/*.json
-npm run send-signed -- --gas-key <gas-key.json> --send out/unsigned/<network-id>/*.json
-
-# 4. Verify, then start capturing
-npm run preflight                     # module column shows the same hash everywhere
+# 3. Verify, then start capturing
+npm run preflight                     # every chain DEPLOYED, one hash
 npm run stream-check -- --seconds 240
 npm run feeder
 npm run oracle -- --last 600          # must print CONSISTENT
 ```
 
-**Signing.** Deploying needs only **gas**: neither the keyset definition nor the module deploy
-requires a keyset signature, because claiming an unclaimed name in `free` is unauthenticated. So each
-file carries one signer, the gas payer, scoped to `coin.GAS`. `send-signed --gas-key` rebuilds each file
-from what it must contain — the backfill keyset definition carrying `BH_BACKFILL_KEYSET`, or the exact
-module source — at `BH_GAS_PRICE` (at most 1e-7) and the deploy's gas limits, and signs it only if the
-bytes match exactly and the chain would still accept it. Without `--send`, nothing signed leaves the machine: each command is checked on the
-node unsigned. With `--send`, the maximum fee is printed first, a module command goes only where the
-keyset is already ours, and each command is preflighted signed just before it is submitted. The key
-file must be readable by its owner alone; its secret is never printed; a re-run skips whatever is
-already on chain before signing it, however old the file.
-The 2-of-3 backfill keyset is the keyset *content* — the authority that lasts, used for backfill
-and for `close-backfill`. At 500 rows per transaction a large backfill takes thousands of
-signatures, so scope it deliberately.
+**Signing.** Deploying needs only **gas**, because a module's first deploy into `free` is
+unauthenticated. So each file carries one signer, the gas payer, scoped to `coin.GAS`.
+
+`send-signed --gas-key` rebuilds each file from what it must contain: the exact module source with
+`{"ns": BH_NS}`, at `BH_GAS_PRICE` (at most 1e-7) and the deploy's gas limit. It signs a file only if
+the bytes match exactly and the chain would still accept it.
+- **Without `--send`,** nothing signed leaves the machine: each command is checked on the node
+  unsigned.
+- **With `--send`,** the maximum fee is printed first, and each command is preflighted signed just
+  before it is submitted.
+- **The key file** must be readable by its owner alone, and its secret is never printed.
+- **A re-run** skips what is already on chain, before signing it.
+- **Commands signed elsewhere** are relayed only if they are exactly the JSON these tools write and
+  define no other module, interface or keyset.
 
 ## Known limits (by design)
-- 100 % capture is unreachable; gaps are honest and, after the close, permanent.
+- 100 % capture is unreachable. Gaps are honest and permanent: nothing can fill them later.
+  Recorders on independent networks are the remedy.
 - Every row is permanent on every node (Pact has no delete): ≈33 GB per node per year for all
   20 chains, a deliberate trade-off.
-- A backfilled row is only as good as the operator's node at write time; the tool never writes
-  within 30 blocks of the tip, and the oracle audits it forever.
 - Node-serialised times: Pact's JSON codec renders a millisecond-aligned time without its
   fraction (`Legacy/LegacyCodec.hs:126-128,153-154`). The row is exact; read times through
   `format-time` off-chain, as the oracle does.
