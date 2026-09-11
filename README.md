@@ -354,8 +354,10 @@ the bytes match exactly and the chain would still accept it.
   about 15 seconds of it: mining nodes add new transactions to the block they are working on only
   every 15 seconds by default, and only the next block can record this one. Keeping an attest
   already waiting (`BH_WAITING_INTERVAL=10`, set by the server setup) raised that to 93.2 % of 1,060
-  heights, at about 3 times the fees; sending through more nodes changed nothing. A second recorder
-  helps against outages, not against the 15-second limit.
+  heights, at about 3 times the fees; sending through more nodes changed nothing. A second
+  recorder with its own waiting attest raised it again, from 91.6 % to 94.0 % over 2,847 heights,
+  since an attest is then waiting twice as often; each recorder pays its own fees, and each keeps
+  recording if the other stops.
 - Names in `free` are first-come. A `free.block-history` on any chain whose deploy transaction is
   not one of the 20 listed here is not this record, whatever its hash, and the name cannot be
   reclaimed on that chain.
