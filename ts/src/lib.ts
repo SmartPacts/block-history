@@ -9,7 +9,7 @@ import {
 import {
   genKeyPair, hash as blakeHash, signHash, verifySig, restoreKeyPairFromSecretKey, hexToBin, base64UrlDecodeArr,
 } from '@kadena/cryptography-utils';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -168,15 +168,19 @@ export type Landed = { requestKey: string; gas: number; data: any; result: IComm
 
 // Preflight, submit, poll. Throws on any failure (preflight or mined).
 export async function send(s: TxSpec): Promise<Landed> {
-  const signed = await buildSigned(s);
+  return sendBuilt(await buildSigned(s), s.chainId, s.label);
+}
+
+// The same for a command already built and signed, so a caller can record it before it is sent.
+export async function sendBuilt(signed: ICommand, chainId: ChainId, label: string): Promise<Landed> {
   const pre = await retrying('preflight', () => client.local(signed, { preflight: true, signatureVerification: true }));
-  if (pre.result.status !== 'success') throw new Error(`${s.label}: preflight FAILED: ${errorText(pre)}`);
+  if (pre.result.status !== 'success') throw new Error(`${label}: preflight FAILED: ${errorText(pre)}`);
   const desc = await retrying('submit', () => client.submit(signed));
-  const r = await pollMined(desc.requestKey, s.chainId, s.label);
-  if (r.result.status !== 'success') throw new Error(`${s.label}: mined tx FAILED: ${errorText(r)}`);
+  const r = await pollMined(desc.requestKey, chainId, label);
+  if (r.result.status !== 'success') throw new Error(`${label}: mined tx FAILED: ${errorText(r)}`);
   const gas = Number((r as any).gas);
   const height = Number((r as any).metaData?.blockHeight ?? -1);
-  console.log(`  ✓ ${s.label}  chain ${s.chainId}  gas=${gas}  height=${height}  rk=${desc.requestKey}`);
+  console.log(`  ✓ ${label}  chain ${chainId}  gas=${gas}  height=${height}  rk=${desc.requestKey}`);
   return { requestKey: desc.requestKey, gas, data: unwrap((r.result as any).data), result: r, height };
 }
 
@@ -380,6 +384,76 @@ export function verifySigned(tx: Emitted, networkId: string): string | null {
       return `signatures: signer ${i + 1} of ${signers.length} does not verify`;
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Whose module a chain carries. A module hash covers the (module …) form only, so a copy someone else
+// deploys — the identical code plus writes of its own in the same transaction, where the deployer holds
+// module admin — carries the SAME hash with forged rows or a forged `latest`. The hash cannot tell the two
+// apart; the transaction that carried the module can.
+
+// Where deploy.ts writes this network's deploy files, one per chain, each named for the module (so for its
+// namespace too).
+export const DEPLOY_DIR = join(OUT, 'unsigned', NETWORK_ID);
+
+export type DeployFile = { file: string; cmd: string; hash: string };
+export type ProofExpect = Pick<DeployExpect, 'networkId' | 'ns' | 'source'>;
+
+// The chain a deploy file can speak for, or a throw naming why it proves nothing. It is judged the way a
+// command signed elsewhere is: fileChain (its hash is its command's own, so the hash is the request key of
+// exactly this command, and the chain is the one the command names), this run's network, and relayKind's
+// module command (this checkout's exact module source, into this run's namespace). A success on chain for
+// any other command proves only that THAT command ran.
+export function proofChain(tx: { cmd: string; hash: string }, x: ProofExpect): ChainId {
+  const chainId = fileChain(tx);
+  const networkId = JSON.parse(tx.cmd).networkId;
+  if (networkId !== x.networkId) fail('network', `the command is for ${networkId}, this run targets ${x.networkId}`);
+  if (relayKind(tx.cmd, x) !== 'module') fail('proof-other', 'it is not the deploy\'s module command: its code is not this checkout\'s exact module source');
+  return chainId;
+}
+
+// The request keys that can speak for a chain: those of the deploy files proofChain accepts for it.
+export function proofKeys(files: { cmd: string; hash: string }[], chainId: ChainId, x: ProofExpect): string[] {
+  return files.filter((tx) => { try { return proofChain(tx, x) === chainId; } catch { return false; } }).map((tx) => tx.hash);
+}
+
+export type Ownership = 'available' | 'ours' | 'lost';
+
+// A chain's module is OURS only when one of the operator's deploy files for that chain has a request key
+// whose status there is success: the file's hash binds the exact payload built and checked here, so that
+// success proves the deploy transaction carried exactly that payload. Present but not proven ours is LOST,
+// whatever its hash. Absent is available. `statuses` is the chain's status lookup of proofKeys: a key in it
+// that belongs to no accepted file counts for nothing, and with no file at all nothing is proven.
+export function ownership(
+  s: { present: boolean; chainId: ChainId; files: { cmd: string; hash: string }[]; statuses: Record<string, ICommandResult | undefined> },
+  x: ProofExpect,
+): Ownership {
+  if (!s.present) return 'available';
+  return proofKeys(s.files, s.chainId, x).some((k) => s.statuses[k]?.result?.status === 'success') ? 'ours' : 'lost';
+}
+
+// The operator's deploy files for this network. `files` holds those proofChain accepts; `refused` names every
+// other file there and why it proves nothing. ownership() still judges every file itself.
+export function readDeployFiles(x: ProofExpect, dir: string = DEPLOY_DIR): { files: DeployFile[]; refused: { file: string; why: string }[] } {
+  const files: DeployFile[] = [], refused: { file: string; why: string }[] = [];
+  if (!existsSync(dir)) return { files, refused };
+  for (const file of readdirSync(dir).filter((n) => n.endsWith('.json')).sort()) {
+    let f: DeployFile;
+    try { const j = JSON.parse(readFileSync(join(dir, file), 'utf8')); f = { file, cmd: j?.cmd, hash: j?.hash }; }
+    catch { refused.push({ file, why: 'not a readable command file' }); continue; }
+    try { proofChain(f, x); files.push(f); } catch (e: any) { refused.push({ file, why: String(e?.message ?? e) }); }
+  }
+  return { files, refused };
+}
+
+// ownership() with the one network step it needs: the chain's status lookup of proofKeys. A lookup the node
+// does not answer throws; it never decides the chain.
+export async function ownershipOn(chainId: ChainId, present: boolean, files: DeployFile[], x: ProofExpect): Promise<Ownership> {
+  const keys = present ? proofKeys(files, chainId, x) : [];
+  const statuses = keys.length
+    ? await retrying('status', () => client.getStatus(keys.map((requestKey) => ({ requestKey, chainId, networkId: x.networkId }))))
+    : {};
+  return ownership({ present, chainId, files, statuses }, x);
 }
 
 export async function balance(account: string, chainId: ChainId): Promise<number> {
