@@ -12,7 +12,7 @@ import { genKeyPair, hash as blakeHash } from '@kadena/cryptography-utils';
 import {
   ROOT, parseChains, parseBinaryHeader, pactTime, microsOf,
   buildUnsignedGasOnly, keysetDeployCode, signGasSlot, validateKeyset, verifySigned, unsignedBody, commandKind,
-  fileChain, statusDecision, relayKind, preflightRequest,
+  fileChain, statusDecision, relayKind, preflightRequest, sameKeyset, errorText,
   type Emitted, type DeployExpect,
 } from './lib.js';
 
@@ -147,6 +147,11 @@ check('status: a command the chain has not seen goes on', statusDecision(undefin
 check('status: a command on chain that succeeded is skipped, however old', statusDecision({ result: { status: 'success', data: 'Write succeeded' } } as any), 'skip');
 check('status: a command on chain that failed stops the run', statusDecision({ result: { status: 'failure', error: { message: 'x' } } } as any), 'fail');
 check('status: a status that cannot be read is never a skip', statusDecision({} as any), 'fail');
+check('status: a status that cannot be read is reported, not a crash', errorText({} as any).startsWith('no readable result'), true);
+refuses('integrity: a command that is not JSON', () => fileChain({ cmd: 'not json', hash: blakeHash('not json') }), 'format-json');
+const dup = ksCmd.cmd.replace('"data":{"ks":', `"data":{"ks":{"keys":["${K('a')}"],"pred":"keys-all"},"ks":`);
+check('integrity fixture: the command carries the key "ks" twice', dup.split('"ks":').length - 1, 2);
+refuses('integrity: a command with a repeated key (this tool and the node could read different commands)', () => fileChain({ cmd: dup, hash: blakeHash(dup) }), 'format-exact');
 
 // ---- commands signed elsewhere -------------------------------------------------------------------
 const relayed = (t: Emitted, fn: (c: any) => void) => edit(t, fn).cmd;
@@ -162,6 +167,9 @@ refuses('relay: a module source one character off', () => relayKind(relayed(modC
 refuses('relay: an interface definition', () => relayKind(relayed(ksCmd, (c) => { c.payload.exec.code = '(interface i (defun f:bool ()))'; }), X), 'content-definition');
 refuses('relay: a module definition with a comment after its opening parenthesis', () => relayKind(relayed(ksCmd, (c) => { c.payload.exec.code = '(namespace "free") ( ; note\n  module m G (defcap G () true))'; }), X), 'content-definition');
 refuses('relay: the backfill keyset defined in another form', () => relayKind(relayed(ksCmd, (c) => { c.payload.exec.code = '(define-keyset "free.block-history-backfill" (read-keyset "ks"))'; }), X), 'content-definition');
+refuses('relay: define-keyset passed to fold instead of called', () => relayKind(relayed(ksCmd, (c) => { c.payload.exec.code = '(namespace "free") (fold define-keyset "free.block-history-backfill" [(read-keyset "ks")])'; }), X), 'content-definition');
+check('sameKeyset: a nested key never matches the configured keyset', sameKeyset({ keys: [[KS.keys[0]], ...KS.keys.slice(1)], pred: KS.pred }, KS), false);
+check('sameKeyset: the configured keyset matches itself in any order', sameKeyset({ keys: [...KS.keys].reverse(), pred: KS.pred }, KS), true);
 
 console.log(fails ? `\n${fails} check(s) FAILED` : '\nall tool checks passed');
 process.exit(fails ? 1 : 0);

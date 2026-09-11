@@ -118,7 +118,9 @@ export async function retrying<T>(what: string, fn: () => Promise<T>, attempts =
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export function errorText(r: ICommandResult): string {
-  const e: any = (r.result as any).error ?? {};
+  const res: any = (r as any)?.result;
+  if (!res) return `no readable result: ${String(JSON.stringify(r)).slice(0, 200)}`;
+  const e: any = res.error ?? {};
   return `${e.message ?? ''} ${e.info ?? ''}`.trim() || JSON.stringify(e);
 }
 
@@ -214,7 +216,7 @@ export const keysetDeployCode = (ns: string) =>
   `(namespace ${JSON.stringify(ns)}) (define-keyset ${JSON.stringify(`${ns}.block-history-backfill`)} (read-keyset "ks"))`;
 export const sameKeyset = (a: any, b: { keys: string[]; pred: string }) =>
   !!a && a.pred === b.pred && Array.isArray(a.keys) && a.keys.length === b.keys.length
-  && [...a.keys].sort().join() === [...b.keys].sort().join();
+  && a.keys.every((k: unknown) => typeof k === 'string') && [...a.keys].sort().join() === [...b.keys].sort().join();
 
 export type Keyset = { keys: string[]; pred: string };
 // The backfill keyset is permanent once claimed, so a malformed one must never reach a command. Pact
@@ -258,11 +260,15 @@ export type GasSigned = { signed: Signed; kind: 'keyset' | 'module'; chainId: Ch
 const fail: (code: string, msg: string) => never = (code, msg) => { throw new Error(`${code}: ${msg}`); };
 
 // A command file's own integrity, checked before the node is asked anything about it: its hash is the
-// hash of its command, and it names a chain 0-19. Returns that chain.
+// hash of its command, the command is exactly the JSON the tools write, and it names a chain 0-19.
+// Returns that chain. Only the exact form is accepted: a command with a repeated key, for example, can be
+// read one way here and another way by the node.
 export function fileChain(tx: { cmd: string; hash: string }): ChainId {
   if (typeof tx?.cmd !== 'string' || blakeHash(tx.cmd) !== tx.hash) fail('hash', 'the file hash does not match its command');
-  let chainId: unknown;
-  try { chainId = JSON.parse(tx.cmd)?.meta?.chainId; } catch { /* refused just below */ }
+  let cmd: any;
+  try { cmd = JSON.parse(tx.cmd); } catch { fail('format-json', 'the command is not JSON'); }
+  if (JSON.stringify(cmd) !== tx.cmd) fail('format-exact', 'the command is not in the exact form the tools write, so this tool and the node could read different commands from it');
+  const chainId: unknown = cmd?.meta?.chainId;
   if (typeof chainId !== 'string' || !/^1?[0-9]$/.test(chainId)) fail('chain', `not a chain id 0-19: ${JSON.stringify(chainId)}`);
   return chainId as ChainId;
 }
@@ -359,8 +365,10 @@ export function commandKind(cmdText: string, ns: string, source: string): 'keyse
 }
 
 // A module, interface or keyset definition anywhere in Pact code. Pact allows whitespace and comments
-// (`;` to the end of the line) between the parenthesis and the keyword.
-const DEFINITION = /\((?:\s|;[^\n]*\n)*(?:module|interface|define-keyset)\b/;
+// (`;` to the end of the line) between the parenthesis and the keyword `module` or `interface`, both
+// special forms. define-keyset is an ordinary function that can also be passed to fold or map, so any
+// mention of it counts; a false match only refuses.
+const DEFINITION = /\((?:\s|;[^\n]*\n)*(?:module|interface)\b|define-keyset/;
 
 // For commands signed elsewhere: commandKind, or a throw naming why it cannot be sent. The deploy's two
 // commands must carry what the gas-key signer demands of them. Any other module, interface or keyset

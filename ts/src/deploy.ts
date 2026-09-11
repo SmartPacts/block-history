@@ -14,7 +14,7 @@
 // owns backfill on that chain forever, because the module can never be upgraded. Hence the
 // two-pass rule enforced below: the module is never emitted or sent until the keyset is
 // confirmed on chain with our exact keys.
-import { readFileSync, mkdirSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, existsSync, unlinkSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChainId } from '@kadena/client';
 import {
@@ -154,6 +154,9 @@ async function main() {
   if (!isDevnet() && UNSIGNED === false) {
     throw new Error(`refusing to sign and send on ${NETWORK_ID} directly: use --unsigned, then npm run send-signed -- --gas-key <key.json>`);
   }
+  // Deploy files an earlier version wrote straight into out/unsigned/ are no longer read or cleaned up.
+  const flat = existsSync(join(OUT, 'unsigned')) ? readdirSync(join(OUT, 'unsigned')).filter((f) => /^chain\d\d-.*\.json$/.test(f)) : [];
+  if (UNSIGNED && flat.length) console.log(`  note: ${flat.length} deploy file(s) from an earlier version sit directly in out/unsigned/ and are ignored; this network's files are in out/unsigned/${NETWORK_ID}/`);
   const results: { chain: ChainId; hash: string; status: string }[] = [];
   // a few chains at a time: independent mempools, one node
   const queue = [...CHAINS];

@@ -12,14 +12,14 @@
 // while the chain it names would still accept it.
 // Without --gas-key every signature a file carries must verify (lib.ts: verifySigned). Either way the
 // deploy's two commands must carry that same content, so neither is sent without BH_BACKFILL_KEYSET, and
-// a command signed elsewhere that defines any other module, interface or keyset is refused (lib.ts:
-// relayKind).
+// a command signed elsewhere that defines any other module or interface, or uses define-keyset, is
+// refused (lib.ts: relayKind). Every file must be exactly the JSON the tools write (lib.ts: fileChain).
 // CHECK ONLY (no --send): nothing signed leaves this machine. Each command is preflighted on the node as
 // a body rebuilt with no signature (lib.ts: preflightRequest), whatever the file carries.
 // SEND: the maximum fee is printed first. A module command, signed here or elsewhere, is sent only on a
 // chain whose backfill keyset is already ours. Each command is preflighted, signed, immediately before
-// it is submitted. A command already on chain is skipped before it is signed or checked, so re-running
-// after a partial session is safe however long ago it was.
+// it is submitted. A command already on chain is skipped without being signed, once it is confirmed to be
+// one this run would accept, so re-running after a partial session is safe however long ago it was.
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ChainId, ICommand } from '@kadena/client';
@@ -77,7 +77,7 @@ const expect = { networkId: NETWORK_ID, ns: NS, source: SOURCE, keyset, gasPrice
 
 console.log(`send-signed → ${API}  ${doSend ? 'SEND' : '(check only — nothing signed leaves this machine)'}`);
 // Read every file and check its hash and chain, then ask that chain, once, whether the command is already
-// there: one already on chain is skipped before it is signed or checked.
+// there: one already on chain is skipped without being signed.
 const loaded: { file: string; tx: Emitted; chainId: ChainId }[] = [];
 for (const f of files) {
   let tx: Emitted | null = null;
@@ -91,7 +91,14 @@ for (const l of loaded) {
   const prior = (await retrying('status', () => client.getStatus(d)))[l.tx.hash];
   const step = statusDecision(prior);
   if (step === 'fail') die(`${l.file} is already on chain and FAILED there — ${errorText(prior)}`);
-  if (step === 'skip') { console.log(`  · already on chain, skipped: ${l.file}`); skipped++; }
+  if (step === 'skip') {
+    // Even a command already on chain must be one this run would accept: a spent file of another kind or
+    // content means the chain holds something this deploy did not intend, and that is said now.
+    let kind = '';
+    try { kind = relayKind(l.tx.cmd, expect); } catch (e: any) { die(`${l.file} is already on chain, but this run would have refused it — ${e?.message ?? e}`); }
+    if (gasKey && kind === 'other') die(`${l.file} is already on chain, but it is not one of the deploy's two commands`);
+    console.log(`  · already on chain (${kind}), skipped: ${l.file}`); skipped++;
+  }
   else pending.push(l);
 }
 // A command is signed only while its chain would still accept it, so each chain is asked for its own time.
