@@ -149,8 +149,10 @@ check the same facts from the request keys above.
 | Coverage in the feeder's active window | **99.875 %**: 4,000 heights, 5 gaps, 0 mismatches (oracle CONSISTENT) |
 | Mainnet header stream (read-only, 240 s, public proxy) | all 20 chains on one connection, 167 events, 0.70 blocks/s network-wide, 0 unparseable |
 
-On mainnet one feeder burns ≈0.0060 KDA per chain per day (about 208 gas per record): 0.5 KDA per
-chain (10 KDA total) is ≈83 days, and a year on all 20 chains is ≈44 KDA. The deploy itself is ≈0.0008 KDA in total.
+On mainnet a feeder with an attest waiting every 10 seconds (the server setup's default) burns
+≈0.016 KDA per chain per day, ≈116 KDA a year for all 20 chains. Reacting to blocks only, it burns
+≈0.0054 (≈40 KDA a year) and records about 75 % of blocks instead of about 93 %. Both measured on
+mainnet. The deploy itself is ≈0.0008 KDA in total.
 
 ### Deploy-ceremony rehearsal
 - Rehearsed end to end on a fresh devnet, from a fresh clone, under mainnet's own namespace:
@@ -347,11 +349,13 @@ the bytes match exactly and the chain would still accept it.
 
 ## Known limits (by design)
 - 100 % capture is unreachable. Gaps are honest and permanent: nothing can fill them later. On
-  mainnet, one recorder that reacts to each new block captured 74.0 % of 1,200 heights across the 20
-  chains on 2026-09-11, with 0 mismatches. A block is missed when the next block is found within
+  mainnet, a recorder that only reacts to each new block captured 75.1 % of 9,600 heights across the
+  20 chains on 2026-09-11, with 0 mismatches. A block is missed when the next block is found within
   about 15 seconds of it: mining nodes add new transactions to the block they are working on only
-  every 15 seconds by default, and only the next block can record this one. A second recorder helps
-  against outages, not against that.
+  every 15 seconds by default, and only the next block can record this one. Keeping an attest
+  already waiting (`BH_WAITING_INTERVAL=10`, set by the server setup) raised that to 93.2 % of 1,060
+  heights, at about 3 times the fees; sending through more nodes changed nothing. A second recorder
+  helps against outages, not against the 15-second limit.
 - Names in `free` are first-come. A `free.block-history` on any chain whose deploy transaction is
   not one of the 20 listed here is not this record, whatever its hash, and the name cannot be
   reclaimed on that chain.

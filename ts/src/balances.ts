@@ -3,18 +3,19 @@
 //   npm run balances -- k:<public key>
 //
 // Runway uses the MAINNET block rate (2,878 blocks per chain per day, measured over 40,000
-// consecutive blocks) and 208 gas per recorded block (measured on mainnet in the live feeder's first minutes). A
-// redundant feeder's losing attests cost less, so for a second feeder this errs on the long side.
+// consecutive blocks) and the gas one feeder spends per block, measured on mainnet (lib.ts: feederGasPerBlock),
+// for the BH_WAITING_INTERVAL this environment sets: about 189 gas reacting to blocks only, about 552 with an
+// attest waiting every 10 s. A second feeder's own no-ops cost it less, so for it this errs on the long side.
 //
 // "unfunded" means the chain answered and the account holds nothing there. A chain that could not
 // be READ is reported as an error, never as zero — an unreachable node must not look like an
 // empty wallet. Exit 0 = funded on every chain; 1 = at least one chain unfunded; 2 = unreadable.
 import type { ChainId } from '@kadena/client';
-import { API, NETWORK_ID, GAS_PRICE, parseChains, local } from './lib.js';
+import { API, NETWORK_ID, GAS_PRICE, parseChains, local, feederGasPerBlock, parseWaitingInterval } from './lib.js';
 
 const BLOCKS_PER_DAY = 2878;
-const GAS_PER_ATTEST = 208;
-const PER_DAY = BLOCKS_PER_DAY * GAS_PER_ATTEST * GAS_PRICE;
+const WAITING = parseWaitingInterval(process.env.BH_WAITING_INTERVAL);
+const PER_DAY = BLOCKS_PER_DAY * feederGasPerBlock(WAITING) * GAS_PRICE;
 
 const acct = process.argv[2];
 if (!acct) {
@@ -38,7 +39,7 @@ async function read(c: ChainId): Promise<Row> {
 
 async function main() {
   console.log(`\n=== balances (read-only) → ${API}  network ${NETWORK_ID}\n    account ${acct}`);
-  console.log(`    one feeder burns ≈${PER_DAY.toFixed(5)} KDA per chain per day on mainnet\n`);
+  console.log(`    one feeder burns ≈${PER_DAY.toFixed(5)} KDA per chain per day on mainnet${WAITING === null ? ', reacting to blocks only' : `, with an attest waiting every ${WAITING} s`}\n`);
   const rows = await Promise.all(CHAINS.map(read));
   let total = 0, unfunded = 0, unreadable = 0, minDays = Infinity;
   console.log('chain   balance KDA    runway');

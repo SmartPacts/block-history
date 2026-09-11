@@ -204,6 +204,8 @@ BH_ATTEST_GAS_LIMIT=400
 BH_ATTEST_TTL=300
 BH_MAX_INFLIGHT=4
 BH_SAMPLE_POLL=25
+# One attest waiting per chain every 10 s: about 93 % of blocks instead of about 75 %, at about 3 times the fees.
+BH_WAITING_INTERVAL=10
 EOF
 chmod 644 "$APP/ts/.env"
 ok "mainnet01 via $MAINNET_HOST, namespace free, chains 0-19"

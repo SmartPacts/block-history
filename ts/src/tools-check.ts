@@ -22,7 +22,7 @@ import {
   ROOT, parseChains, parseBinaryHeader, pactTime, microsOf,
   buildUnsignedGasOnly, signGasSlot, verifySigned, unsignedBody, commandKind,
   fileChain, statusDecision, relayKind, spentKind, preflightRequest, errorText, proofChain, ownership,
-  readDeployFiles, supersede, fileFate, planChain, validUntil, utc,
+  readDeployFiles, supersede, fileFate, planChain, validUntil, utc, feederGasPerBlock,
   parseSubmitHosts, sendUrl, fanoutOutcome, ALREADY_KNOWN, parseWaitingInterval, jitterDelay,
   type Emitted, type DeployExpect, type FileFate,
 } from './lib.js';
@@ -339,6 +339,8 @@ check('jitter: the delay runs from 20 % under the interval to 20 % over it', [ji
 const draws = Array.from({ length: 10_000 }, () => jitterDelay(2, Math.random()));
 const [lo, hi] = [Math.min(...draws), Math.max(...draws)];
 check('jitter: 10,000 random delays at the 2 s floor stay within 1.6-2.4 s, and spread across it', [lo >= 1600, hi <= 2400, lo < 1700, hi > 2300], [true, true, true, true]);
+check('runway model: reactive sending costs 189 gas per block', feederGasPerBlock(null), 189);
+check('runway model: a waiting attest every 10 s adds three no-ops, 552 gas per block', feederGasPerBlock(10), 552);
 
 console.log(fails ? `\n${fails} check(s) FAILED` : '\nall tool checks passed');
 process.exit(fails ? 1 : 0);

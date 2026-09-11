@@ -725,3 +725,9 @@ export function parseWaitingInterval(spec: string | undefined): number | null {
 // The delay before a chain's next waiting attest, in ms: the interval ±WAITING_JITTER for `rand` uniform
 // in [0, 1), so the chains' timers drift apart instead of firing together.
 export const jitterDelay = (seconds: number, rand: number) => Math.round(seconds * 1000 * (1 + WAITING_JITTER * (2 * rand - 1)));
+
+// The gas one feeder spends per block on a chain, from mainnet balances (2026-09-11): reactive sending averages 189
+// gas per block (records and the occasional no-op together); each waiting attest adds a no-op of about 121. At 30 s
+// blocks and BH_WAITING_INTERVAL=10 that is 552 gas per block, about 2.9 times reactive sending.
+export const REACTIVE_GAS = 189, WAITING_GAS = 121, BLOCK_SECONDS = 30;
+export const feederGasPerBlock = (waiting: number | null) => REACTIVE_GAS + (waiting === null ? 0 : (BLOCK_SECONDS / waiting) * WAITING_GAS);
