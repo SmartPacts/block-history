@@ -350,9 +350,7 @@ the bytes match exactly and the chain would still accept it.
   Recorders on independent networks are the remedy.
 - Names in `free` are first-come. A `free.block-history` on any chain whose deploy transaction is
   not one of the 20 listed here is not this record, whatever its hash, and the name cannot be
-  reclaimed on that chain. A module there whose name differs only in letter case, and which
-  defines the same table names, also blocks this deploy on that chain: the node compares table
-  names without regard to case, and refuses to create one that exists.
+  reclaimed on that chain.
 - Every row is permanent on every node (Pact has no delete): ≈33 GB per node per year for all
   20 chains, a deliberate trade-off.
 - Node-serialised times: Pact's JSON codec renders a millisecond-aligned time without its
