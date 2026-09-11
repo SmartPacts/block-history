@@ -32,18 +32,30 @@ supports only `TXOUT`. So the record holds only what was witnessed. Blocks befor
 | `key h` | pure | the 12-digit zero-padded row key |
 
 `attest` is the only function that writes. It takes no arguments, so a caller decides only
-whether a row is written, never what it says.
+whether a row is written, never the height, hash or time it holds. `by` is the recording
+transaction's gas payer, which whoever submits the transaction chooses: it says who paid, and
+nothing about the block.
 
 Each invariant is pinned by a test that a generated mutant turns red (`pact/tests/run.sh`):
 - every value comes from `(chain-data)`, and `attest` takes no arguments;
 - a recorded row is never rewritten, and a duplicate never aborts;
 - no function but `attest` writes a row;
+- a height never recorded is absent: `has-attested` answers false, and every other read aborts;
+- a `latest` planted by a deploy transaction is replaced by the first record `attest` writes;
 - the module cannot be upgraded and its tables cannot be written from outside (`GOVERNANCE` is
   `enforce false`).
 
 Settle on `hash` and on heights. `time` is the block's miner-stamped creation time — exact to the
-microsecond on chain, but metadata. The value a row will hold is public one block before it is
-written, so this is a provenance record, not a randomness beacon.
+microsecond on chain, but metadata. `by` is informational.
+
+**Not a randomness source,** even for a height committed to in advance. The value a row will hold
+is public one block before it is written. The miner of block H can withhold it, and the miner of
+H+1 alone decides whether H is recorded at all, because only block H+1 can record H. A contract
+that settles on a height must make an absent row neutral for every party.
+
+**Forks.** A contract always reads the instance on its own fork, so what it sees agrees with the
+block it runs in. An off-chain reader at the tip can see a row that a reorg later replaces: wait
+for as many confirmations as your application needs before acting on a fresh row.
 
 ### Reading it from another contract
 
@@ -62,14 +74,14 @@ Each release lists its commit, the module hash and the sha256 of the module sour
 
 - The module hash is computed by the engine, excludes comments, and is the same on all 20 chains.
   The expected mainnet hash, computed by mainnet's own engine in a read-only dry run, is
-  `gV_Txq3_1nvxK7zgwJM8ZoFBunBYpuTmHaClyF9G4kU`.
+  `P3J_LK-Wivmuyw7SB7TzPmfj6t-GCtG3YnfHNAaU2UU`.
 - `(describe-module "free.block-history")` on any chain returns that `hash`, and a `code` field
   holding the source from `(module` to its closing parenthesis. Compare it with the file.
 - `npm run preflight` (read-only) prints the hash every chain reports.
 - The hash proves the code, not the starting state: the transaction that deploys a module can also
-  write to its tables. So check that each chain's deploy transaction carries exactly the published
-  file and nothing else. The request keys of the 20 deploy transactions are listed here once the
-  module is deployed.
+  write to its tables. So check each chain's deploy transaction: its request key succeeded on that
+  chain, and its command is exactly the published module source with `{"ns":"free"}` in its data,
+  and nothing else. The 20 request keys are listed here once the module is deployed.
 - A keyset named `free.block-history-backfill` exists on all 20 chains. An earlier deploy plan, which
   included a trusted backfill, defined it on 2026-09-11; that plan was dropped before the module was
   deployed. The published module does not reference the keyset, and the keyset has no power over
@@ -97,28 +109,40 @@ Each release lists its commit, the module hash and the sha256 of the module sour
 ### Measured on devnet (`recap-development`, chainweb-node 3.2.1, 20 chains, ~0.85 blocks/s/chain)
 | Item | Value |
 |---|---|
-| Module hash (identical on all 20 chains) | `gV_Txq3_1nvxK7zgwJM8ZoFBunBYpuTmHaClyF9G4kU` |
-| Deploy gas per chain | 4,339 |
-| `attest` gas on a node | 204 on average over 279 sampled mined transactions, 0 failed |
-| `attest` in the REPL gas model (record / duplicate no-op) | 91 / 15 |
-| Feeder soak, 6 min, 20 chains | 6,560 events, 6,560 submitted, 0 submit errors, 0 reconnects |
-| Coverage in the feeder's active window | **99.80 %**: 4,000 heights, 8 gaps, 0 mismatches (oracle CONSISTENT) |
+| Module hash (identical on all 20 chains) | `P3J_LK-Wivmuyw7SB7TzPmfj6t-GCtG3YnfHNAaU2UU` |
+| Deploy gas per chain | 4,199 |
+| `attest` gas on a node | 191 on average over 271 sampled mined transactions, 0 failed |
+| `attest` in the REPL gas model (record / duplicate no-op) | 87 / 15 |
+| Feeder soak, 6 min, 20 chains | 6,523 events, 6,523 submitted, 0 submit errors, 0 reconnects |
+| Coverage in the feeder's active window | **99.875 %**: 4,000 heights, 5 gaps, 0 mismatches (oracle CONSISTENT) |
 | Mainnet header stream (read-only, 240 s, public proxy) | all 20 chains on one connection, 167 events, 0.70 blocks/s network-wide, 0 unparseable |
 
-One feeder burns ≈0.0059 KDA per chain per day: 0.5 KDA per chain (10 KDA total) is ≈84 days,
-and a year on all 20 chains is ≈43 KDA. The deploy itself is ≈0.0009 KDA in total.
+One feeder burns ≈0.0055 KDA per chain per day: 0.5 KDA per chain (10 KDA total) is ≈91 days,
+and a year on all 20 chains is ≈40 KDA. The deploy itself is ≈0.0008 KDA in total.
 
 ### Deploy-ceremony rehearsal
 - Rehearsed end to end on a fresh devnet, from a fresh clone, under mainnet's own namespace:
-  21 of 21 checks.
+  31 of 31 checks.
   - The preflight dry run matched the mainnet hash, and all 20 chains deployed with that one hash.
   - Every refusal held: a secret on the command line, a key file others can read, a duplicate
     file, an altered file.
-  - An unsigned check-only pass sent nothing signed.
+  - A second pass before sending kept all 20 files unchanged: nothing was regenerated.
+  - An unsigned check-only pass sent nothing signed. The send then preflighted all 20 signed,
+    submitted all 20 at once, and waited for each.
   - Files already on chain were skipped before signing, and refused when judged for another
     namespace.
   - A second pass had nothing left to do, and a repeated send sent nothing.
   - The stored code equals the file and there are no rows; no key file was opened at any point.
+- A copycat, in a second namespace on the same devnet: another account deployed the identical
+  module first on one chain, with a `latest` and a row planted in the same transaction.
+  - Preflight reported that chain LOST before the deploy and after it, although its hash is
+    ours, and the files already mined for the other namespace proved nothing there.
+  - The operator's files already existed. Deploy moved the lost chain's file aside, where it
+    still counts as proof, kept the other 19 unchanged, and those 19 deployed.
+  - One honest `attest` there replaced the planted `latest`. The planted row remained, which is
+    why such a chain is never counted as ours.
+  - With the deploy files moved away, preflight reported all 20 held names LOST: nothing is
+    proven without them.
 - An earlier rehearsal found a deploy bug, since fixed: the unsigned flow named the local devnet
   key as signer instead of the gas payer, which made every emitted file unsignable.
 
@@ -235,9 +259,16 @@ refuses to overwrite one.
 ### Deploying to a network — one pass
 
 In `free`, the user guard is `ns.success`, so every name there is first-come, and a module's first
-deploy needs no signature except the gas payer's. The module references no keyset, so there is
-nothing to claim first. One transaction per chain carries the module source, with `{"ns": BH_NS}`
-in its data. `npm run preflight` reports a chain whose name is held by a different module as LOST.
+deploy needs no signature except the gas payer's. One transaction per chain carries the module
+source, with `{"ns": BH_NS}` in its data.
+
+That makes the deploy itself a race. A module hash proves the code, not the starting state, and
+once the first chain holds the module its code is public: anyone could deploy the same code, with
+planted rows, on a chain the operator has not reached yet. So every file is preflighted first and
+then all are submitted at once. A chain counts as deployed only when the request key of one of the
+operator's own deploy files, checked to be exactly this module for this namespace, succeeded there.
+`npm run preflight` checks that against the files in `ts/out/unsigned/<network-id>/` and reports any
+other holder of the name as LOST, even one with the right hash.
 
 ```
 # 0. READ-ONLY readiness. Sends nothing. Exit 0 = GO, 1 = not ready, 2 = a name is LOST.
@@ -248,13 +279,15 @@ npm run preflight
 #    (<network-id> is BH_NETWORK_ID, e.g. mainnet01)
 npm run deploy -- --unsigned
 
-# 2. Sign the gas payer's slot of every file, check it and preflight it on the node — nothing
-#    is sent — then send them one by one, and confirm they landed
+# 2. Sign the gas payer's slot of every file and preflight it on the node. Nothing is sent.
+#    Then with --send: preflight every file signed, submit all of them at once, and wait for
+#    each to land
 npm run send-signed -- --gas-key <gas-key.json> out/unsigned/<network-id>/*.json
 npm run send-signed -- --gas-key <gas-key.json> --send out/unsigned/<network-id>/*.json
 
-# 3. Verify, then start capturing
-npm run preflight                     # every chain DEPLOYED, one hash
+# 3. Verify, then start capturing. Wait a few minutes first: a block can still be replaced in its
+#    first confirmations, so "ours" is final only once the deploy blocks are buried.
+npm run preflight                     # every chain DEPLOYED and ours, one hash
 npm run stream-check -- --seconds 240
 npm run feeder
 npm run oracle -- --last 600          # must print CONSISTENT
@@ -268,8 +301,13 @@ unauthenticated. So each file carries one signer, the gas payer, scoped to `coin
 the bytes match exactly and the chain would still accept it.
 - **Without `--send`,** nothing signed leaves the machine: each command is checked on the node
   unsigned.
-- **With `--send`,** the maximum fee is printed first, and each command is preflighted signed just
-  before it is submitted.
+- **With `--send`,** the maximum fee is printed first. Every command is preflighted signed, nothing
+  is submitted unless all of them pass, and then they are all submitted at once. A command not
+  mined while it waits may still land until its creation time plus its ttl: re-run the same send,
+  and never regenerate its file.
+- **Deploy files are never overwritten or deleted.** A re-run of `deploy --unsigned` keeps a file
+  whose command can still land. One that failed or expired, or whose chain is LOST, moves into
+  `superseded/`, out of the send's reach, and still counts as proof.
 - **The key file** must be readable by its owner alone, and its secret is never printed.
 - **A re-run** skips what is already on chain, before signing it.
 - **Commands signed elsewhere** are relayed only if they are exactly the JSON these tools write and
@@ -278,6 +316,11 @@ the bytes match exactly and the chain would still accept it.
 ## Known limits (by design)
 - 100 % capture is unreachable. Gaps are honest and permanent: nothing can fill them later.
   Recorders on independent networks are the remedy.
+- Names in `free` are first-come. A `free.block-history` on any chain whose deploy transaction is
+  not one of the 20 listed here is not this record, whatever its hash, and the name cannot be
+  reclaimed on that chain. A module there whose name differs only in letter case, and which
+  defines the same table names, also blocks this deploy on that chain: the node compares table
+  names without regard to case, and refuses to create one that exists.
 - Every row is permanent on every node (Pact has no delete): ≈33 GB per node per year for all
   20 chains, a deliberate trade-off.
 - Node-serialised times: Pact's JSON codec renders a millisecond-aligned time without its
