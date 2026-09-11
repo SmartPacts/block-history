@@ -346,8 +346,12 @@ the bytes match exactly and the chain would still accept it.
   define no other module, interface or keyset.
 
 ## Known limits (by design)
-- 100 % capture is unreachable. Gaps are honest and permanent: nothing can fill them later.
-  Recorders on independent networks are the remedy.
+- 100 % capture is unreachable. Gaps are honest and permanent: nothing can fill them later. On
+  mainnet, one recorder that reacts to each new block captured 74.0 % of 1,200 heights across the 20
+  chains on 2026-09-11, with 0 mismatches. A block is missed when the next block is found within
+  about 15 seconds of it: mining nodes add new transactions to the block they are working on only
+  every 15 seconds by default, and only the next block can record this one. A second recorder helps
+  against outages, not against that.
 - Names in `free` are first-come. A `free.block-history` on any chain whose deploy transaction is
   not one of the 20 listed here is not this record, whatever its hash, and the name cannot be
   reclaimed on that chain.
