@@ -4,8 +4,8 @@
 ;; describes the PREVIOUS block: in the block at height N, `prev-block-hash` is the hash
 ;; of block N-1 and `block-time` is block N-1's creation time. So a transaction mined in
 ;; block N can write down a complete record of block N-1 using values it was handed by
-;; the engine — nobody chose them, nobody can forge them. One block later that window is
-;; gone for good. This module is the writing down.
+;; the engine: no transaction chose them, and none can forge them. One block later that
+;; window is gone for good. This module is the writing down.
 ;;
 ;; ONE WRITER, NO ARGUMENTS. Every row is written by `attest`, which takes no arguments:
 ;; key and value both come from (chain-data), so a caller decides only WHETHER a row is
