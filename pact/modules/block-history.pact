@@ -33,6 +33,10 @@
 ;; whether H is recorded at all, because only a transaction in H+1 can record it. So a
 ;; consumer that settles anything on a height must make an absent height neutral for
 ;; every party.
+;;
+;; ALL OF THIS ASSUMES A CLEAN DEPLOY. The transaction that deploys this module can also
+;; write its tables, and the module hash cannot show it. A copy whose deploy transaction
+;; did so is not this record, whatever its hash: check the deploy transaction itself.
 
 (namespace (read-msg 'ns))
 

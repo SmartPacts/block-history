@@ -3,8 +3,8 @@
 ;; The vision: every row is the engine's own account of a block, written by the one
 ;; function that writes, which takes no arguments; a caller decides only WHETHER a row is
 ;; written, never what it says; a recorded height is final; an unrecorded height is
-;; absent, never a default; latest is the newest record, whatever the deploy left in it;
-;; the code can never change.
+;; absent, never a default; a latest planted by the deploy is replaced by the first
+;; record; the code can never change.
 ;; run.sh builds one mutant of the module per clause and requires this file to FAIL
 ;; against each, for the reason named beside it:
 ;;   caller-value   attest takes the hash from transaction data    VISION-1a: the caller's hash landed
@@ -124,7 +124,7 @@
   (free.block-history.time-of 1001))
 (commit-tx)
 
-;; ---- VISION-7: latest is the newest record, whatever the deploy left in it ---------
+;; ---- VISION-7: a latest planted by the deploy is replaced by the first record ------
 ;; The transaction that deploys the module holds its module admin until it ends, so code
 ;; after the module form can write its tables. Here a fresh deploy plants a latest far
 ;; above the chain; the first honest record must replace it. Times after the load are
