@@ -78,6 +78,7 @@ for (const c of CHAINS) stats.set(c, { lastHeight: -1, events: 0, submitted: 0, 
 // Per extra host: attests it took, attests it did not, and sends to it still unanswered.
 const fanStats = new Map(SUBMIT_HOSTS.map((h) => [h, { delivered: 0, failed: 0, inflight: 0 }]));
 const FANOUT_CAP = MAX_INFLIGHT * CHAINS.length;
+const FANOUT_TIMEOUT_MS = 25_000;   // a host that has not answered by then counts as failed
 const waitTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let reconnects = 0;
 const started = Date.now();
@@ -164,7 +165,7 @@ async function fanOut(signed: ICommand, c: ChainId): Promise<Record<string, 'ok'
     if (f.inflight < FANOUT_CAP) {
       f.inflight++;
       try {
-        const res = await fetch(sendUrl(host, NETWORK_ID, c), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmds: [signed] }) });
+        const res = await fetch(sendUrl(host, NETWORK_ID, c), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cmds: [signed] }), signal: AbortSignal.timeout(FANOUT_TIMEOUT_MS) });
         r = fanoutOutcome(res.status, await res.text(), signed.hash);
       } catch { /* no answer within the deadline, or no connection: failed */ }
       finally { f.inflight--; }
