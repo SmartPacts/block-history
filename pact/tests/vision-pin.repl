@@ -2,7 +2,9 @@
 ;;
 ;; The vision: every row is the engine's own account of a block, written by the one
 ;; function that writes, which takes no arguments; a caller decides only WHETHER a row is
-;; written, never what it says; a recorded height is final; the code can never change.
+;; written, never what it says; a recorded height is final; an unrecorded height is
+;; absent, never a default; latest is the newest record, whatever the deploy left in it;
+;; the code can never change.
 ;; run.sh builds one mutant of the module per clause and requires this file to FAIL
 ;; against each, for the reason named beside it:
 ;;   caller-value   attest takes the hash from transaction data    VISION-1a: the caller's hash landed
@@ -11,6 +13,8 @@
 ;;   abort-dup      a second recording aborts                      VISION-3: the probe caught an abort
 ;;   gov-open       governance can be satisfied                    VISION-4: module admin was granted
 ;;   second-writer  a read function also writes a row              VISION-5: the read-only probe hit a write
+;;   gap-default    get-attested answers a gap with a default row  VISION-6a: the read of a gap returned a row
+;;   latest-guard   attest writes latest only above the old one    VISION-7b: the planted latest survived
 ;; The upgrade half of VISION-4 is frozen.repl-must-fail; the static half of VISION-5 is
 ;; run.sh's DML inventory. run.sh checks both against the same mutants.
 (load "harness.repl")
@@ -96,5 +100,57 @@
   (try "ABORTED" (free.block-history.attest)))
 (expect "VISION-5 control: and nothing landed" false (free.block-history.has-attested 1001))
 (rollback-tx)
+
+;; ---- VISION-6: an unrecorded height is absent, never a default ---------------------
+;; A consumer must be able to tell a gap from a block: has-attested answers false, and
+;; every other read aborts rather than invent a row. 1001 sits between two records; 999
+;; is from before the first attest.
+(env-chain-data { "chain-id": "2", "block-height": 1003, "prev-block-hash": "H1002"
+                , "block-time": (add-time EPOCH 1002), "sender": "bot" })
+(begin-tx)
+(expect "VISION-6 setup: 1002 records, so 1001 is a gap between two records" "recorded"
+  (free.block-history.attest))
+(commit-tx)
+(begin-tx)
+(expect "VISION-6 has-attested is false for a gap" false (free.block-history.has-attested 1001))
+(expect "VISION-6 has-attested is false before the first attest" false (free.block-history.has-attested 999))
+(expect-failure "VISION-6a get-attested aborts on a gap" "No value found in table free.block-history_attested for key: 000000001001"
+  (free.block-history.get-attested 1001))
+(expect-failure "VISION-6a get-attested aborts before the first attest" "No value found in table free.block-history_attested for key: 000000000999"
+  (free.block-history.get-attested 999))
+(expect-failure "VISION-6b hash-of aborts on a gap" "No value found in table free.block-history_attested for key: 000000001001"
+  (free.block-history.hash-of 1001))
+(expect-failure "VISION-6c time-of aborts on a gap" "No value found in table free.block-history_attested for key: 000000001001"
+  (free.block-history.time-of 1001))
+(commit-tx)
+
+;; ---- VISION-7: latest is the newest record, whatever the deploy left in it ---------
+;; The transaction that deploys the module holds its module admin until it ends, so code
+;; after the module form can write its tables. Here a fresh deploy plants a latest far
+;; above the chain; the first honest record must replace it. Times after the load are
+;; literal: once that transaction commits, this file's EPOCH no longer resolves.
+(env-data { "ns": "fresh", "hash": "CALLER-HASH", "by": "caller", "height": 5 })
+(begin-tx)
+(define-namespace "fresh" test-ns.USER-GUARD test-ns.ADMIN-GUARD)
+(commit-tx)
+(env-chain-data { "chain-id": "2", "block-height": 2000, "prev-block-hash": "H1999"
+                , "block-time": (add-time EPOCH 1999), "sender": "deployer" })
+(begin-tx)
+(load "../modules/block-history.pact")
+(write fresh.block-history.latest-tbl "latest"
+  { "height": 999999999999, "hash": "FORGED", "time": (time "1970-01-01T00:00:00Z") })
+(commit-tx)
+(env-data { "hash": "CALLER-HASH", "by": "caller", "height": 5 })
+(env-chain-data { "chain-id": "2", "block-height": 2001, "prev-block-hash": "H2000"
+                , "block-time": (add-time (time "1970-01-01T00:00:00Z") 2000), "sender": "bot" })
+(begin-tx)
+(expect "VISION-7 control: the deploy transaction did plant its latest"
+  { "height": 999999999999, "hash": "FORGED", "time": (time "1970-01-01T00:00:00Z") }
+  (fresh.block-history.latest))
+(expect "VISION-7a the first honest record" "recorded" (fresh.block-history.attest))
+(expect "VISION-7b latest is the engine's record, not the planted one"
+  { "height": 2000, "hash": "H2000", "time": (add-time (time "1970-01-01T00:00:00Z") 2000) }
+  (fresh.block-history.latest))
+(commit-tx)
 
 (print "vision-pin.repl: OK")

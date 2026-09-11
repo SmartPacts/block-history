@@ -61,18 +61,6 @@
   (format-time "%Y-%m-%dT%H:%M:%S.%vZ" (free.block-history.time-of 1003)))
 (commit-tx)
 
-;; ---- P6 latest never moves backwards ----------------------------------------------
-;; A lower height cannot reach attest after a higher one on one fork; the REPL can stage
-;; it, and latest must hold. Rolled back: this chain state is not real.
-(env-chain-data { "chain-id": "2", "block-height": 1002, "prev-block-hash": "H1001"
-                , "block-time": (add-time EPOCH 1001), "sender": "bot-a" })
-(begin-tx)
-(expect "P6 a lower, unrecorded height records" "recorded" (free.block-history.attest))
-(expect "P6b latest keeps the highest height"
-  { "height": 1003, "hash": "H1003", "time": (add-time EPOCH 1003.123456) }
-  (free.block-history.latest))
-(rollback-tx)
-
 ;; ---- P7 key shape ----------------------------------------------------------------
 (begin-tx)
 (expect "P7 keys are 12-wide zero-padded" "000000001010" (free.block-history.key 1010))

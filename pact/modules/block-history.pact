@@ -9,8 +9,11 @@
 ;;
 ;; ONE WRITER, NO ARGUMENTS. Every row is written by `attest`, which takes no arguments:
 ;; key and value both come from (chain-data), so a caller decides only WHETHER a row is
-;; written, never what it says. Rows are unforgeable, and reorg-safe by construction (a
-;; recording transaction lives on the same fork as the block it records).
+;; written, never what it says. Rows are unforgeable and fork-consistent: a recording
+;; transaction lives on the same fork as the block it records, so a contract always reads
+;; its own fork's history. An off-chain reader at the tip has no such guarantee: it can
+;; see a row that a reorg later replaces, so it should wait for confirmations before it
+;; acts on one.
 ;;
 ;; ONLY WHAT WAS WITNESSED. A block is recorded only if a transaction in the very next
 ;; block called `attest`. Blocks from before the first `attest`, and blocks no recorder
@@ -23,10 +26,13 @@
 ;;
 ;; WHAT TO SETTLE ON. `hash` is a consensus commitment the miner cannot forge. `time` is
 ;; the creation time the block's miner stamped, so it can drift by a few seconds — treat
-;; it as metadata and express deadlines as heights. The value a row WILL contain is
-;; public one full block before it is written, so this is a provenance record, not a
-;; randomness beacon: a consumer that draws from it must commit to a height BEFORE that
-;; block exists.
+;; it as metadata and express deadlines as heights.
+;;
+;; NOT A RANDOMNESS SOURCE, not even for a consumer that commits to a height in advance.
+;; The miner of block H can withhold block H, and the miner of block H+1 alone decides
+;; whether H is recorded at all, because only a transaction in H+1 can record it. So a
+;; consumer that settles anything on a height must make an absent height neutral for
+;; every party.
 
 (namespace (read-msg 'ns))
 
@@ -34,9 +40,11 @@
   ;; SPDX-License-Identifier: Apache-2.0
 
   @doc "Append-only record of this chain's blocks: height -> {hash, time, by}. \
-  \`attest` takes no arguments and records the previous block from engine-supplied \
-  \values, so a row can never be wrong. Blocks before the first attest, and blocks \
-  \no recorder attested, are simply absent. The module cannot be upgraded."
+  \`attest` takes no arguments and records the previous block. Its height, hash and \
+  \time are engine values and can never be wrong; `by` is the recording transaction's \
+  \gas payer, chosen by whoever submits it, and is informational only. Blocks before \
+  \the first attest, and blocks no recorder attested, are simply absent. The module \
+  \cannot be upgraded."
 
   ;; ---------------------------------------------------------------------------
   ;; Immutability. Governance is not evaluated on a first deploy, so this installs;
@@ -80,7 +88,8 @@
   ;; Events
   ;; ---------------------------------------------------------------------------
   (defcap ATTESTED (height:integer bhash:string btime:time by:string)
-    @doc "Emitted once per attested block; the event stream is the tamper-evident log."
+    @doc "Emitted once per attested block. A notification, not the record: the row is \
+    \the record, so a reader should confirm an event with `get-attested`."
     @event true)
 
   ;; ---------------------------------------------------------------------------
@@ -112,11 +121,11 @@
         (with-default-read attested k { "hash": "" } { "hash" := have }
           (if (!= have "")
               "already recorded"
-              (let ((prev (at 'height (latest))))
+              ;; On one fork every new record is above all earlier ones, so it is the
+              ;; latest: written unconditionally, nothing left there before survives it.
+              (do
                 (insert attested k { "hash": bh, "time": bt, "by": by })
-                (if (> h prev)
-                    (write latest-tbl "latest" { "height": h, "hash": bh, "time": bt })
-                    "latest unchanged")
+                (write latest-tbl "latest" { "height": h, "hash": bh, "time": bt })
                 (emit-event (ATTESTED h bh bt by))
                 "recorded"))))))
 

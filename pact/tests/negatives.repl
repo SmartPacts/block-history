@@ -139,8 +139,8 @@
   (free.block-history.latest))
 (rollback-tx)
 
-;; The ATTESTED event is the tamper-evident log: nothing outside the module can emit it or
-;; acquire its capability, from the top level or from another module in the same namespace.
+;; Only attest emits ATTESTED: nothing outside the module can emit it or acquire its
+;; capability, from the top level or from another module in the same namespace.
 (begin-tx)
 (namespace "free")
 (module mallory GOVERNANCE

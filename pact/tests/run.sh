@@ -79,6 +79,11 @@ mutant gov-open      'block-history is immutable' 'got result: "Module admin for
   -e "$GOV_OPEN"
 mutant second-writer 'VISION-5 latest' 'Operation disallowed in read-only or sys-only mode' \
   -e "$SECOND_WRITER"
+mutant gap-default   'No value found in table free.block-history_attested for key: 000000001001' 'got result: {"by": ""' \
+  -e 's|^    (read attested (key height)))$|    (with-default-read attested (key height) { "hash": "", "time": EPOCH, "by": "" } { "hash" := x, "time" := y, "by" := z } { "hash": x, "time": y, "by": z }))|'
+mutant latest-guard  'VISION-7b' '"FORGED"' \
+  -e "s|^              (do\$|              (let ((prev (at 'height (latest))))|" \
+  -e 's|^                (write latest-tbl "latest" { "height": h, "hash": bh, "time": bt })$|                (if (> h prev) (write latest-tbl "latest" { "height": h, "hash": bh, "time": bt }) "latest unchanged")|'
 
 # 6. DML inventory. Every row-writing native (insert, update, write) in the module, with the
 #    definition it sits in and the token after it; comments and string contents are ignored.
