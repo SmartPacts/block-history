@@ -57,11 +57,11 @@ async function preflightWorld() {
       () => true,
       (e) => { if (/Cannot find module/i.test(String(e?.message ?? e))) return false; throw e; });
     if (!deployed) throw new Error(`${MODULE} is not deployed on chain ${c} yet. The feeder refuses to start and has sent nothing. Deploy the module first, then start it again.`);
-    const st = await local(`(${MODULE}.backfill-status)`, { chainId: c });
+    const latest = await local(`(${MODULE}.latest)`, { chainId: c });
     const bal = await balance(sender, c);
     if (bal <= 0) throw new Error(`chain ${c}: ${sender} holds no KDA — fund it (npm run deploy funds it on a devnet)`);
     if (bal < 0.05) console.log(`  ! chain ${c}: balance ${bal} KDA is low (each attest costs ~${(GAS_LIMIT * GAS_PRICE).toExponential(1)} KDA at most)`);
-    console.log(`  chain ${c}: module present (backfill ${st.open ? 'open' : 'closed'}), balance ${bal} KDA`);
+    console.log(`  chain ${c}: module present (latest recorded height ${latest.height}), balance ${bal} KDA`);
   }
 }
 

@@ -31,7 +31,6 @@ export const HOST = process.env.BH_HOST ?? 'http://localhost:8095';
 export const NETWORK_ID = process.env.BH_NETWORK_ID ?? 'recap-development';
 export const NS = process.env.BH_NS ?? 'free';
 export const MODULE = `${NS}.block-history`;
-export const BACKFILL_KEYSET = `${NS}.block-history-backfill`;
 export const GAS_PRICE = Number(process.env.BH_GAS_PRICE ?? '1e-8');
 export const API = `${HOST}/chainweb/0.0/${NETWORK_ID}`;
 
@@ -181,12 +180,17 @@ export async function send(s: TxSpec): Promise<Landed> {
   return { requestKey: desc.requestKey, gas, data: unwrap((r.result as any).data), result: r, height };
 }
 
+// One status lookup a second until the node reports the command. Not client.pollOne: its retry re-arms
+// its deadline as the time left minus the pause it has just slept, so a slice could end on a negative
+// setTimeout, which Node reports as a TimeoutNegativeWarning.
 export async function pollMined(requestKey: string, chainId: ChainId, label: string, maxWaitMs = 600_000): Promise<ICommandResult> {
   const started = Date.now();
   while (Date.now() - started < maxWaitMs) {
     try {
-      return await client.pollOne({ requestKey, chainId, networkId: NETWORK_ID }, { timeout: 20_000, interval: 1_000 });
-    } catch { /* not yet mined within the slice */ }
+      const r = (await client.getStatus({ requestKey, chainId, networkId: NETWORK_ID }))[requestKey];
+      if (r) return r;
+    } catch { /* the node did not answer this time; ask again */ }
+    await sleep(1_000);
   }
   throw new Error(`${label}: ${requestKey} not mined after ${Math.round((Date.now() - started) / 1000)}s`);
 }
@@ -204,40 +208,17 @@ export async function sendExpectFail(s: TxSpec, mustContain: string): Promise<st
 
 
 // ---------------------------------------------------------------------------------------------
-// The deploy's two commands, built in ONE place so the gas-key signer can recognise them exactly.
-// The gas payer's signature is scoped to coin.GAS: neither command needs it for anything else
-// (claiming an unclaimed name in `free`, and a module's first deploy, are unauthenticated), so a
-// signature on them can pay gas and nothing more.
-export const KEYSET_GAS_LIMIT = 2000;
+// The deploy's one command — the module source with {"ns": BH_NS} — built in ONE place so the gas-key
+// signer can recognise it exactly. The gas payer's signature is scoped to coin.GAS: a module's first
+// deploy into `free` needs no other signature, so a signature on it can pay gas and nothing more.
 export const MODULE_GAS_LIMIT = 120000;
 // Ten times the network's minimum price: a mistyped BH_GAS_PRICE stops here instead of being signed.
 export const MAX_GAS_PRICE = 1e-7;
-export const keysetDeployCode = (ns: string) =>
-  `(namespace ${JSON.stringify(ns)}) (define-keyset ${JSON.stringify(`${ns}.block-history-backfill`)} (read-keyset "ks"))`;
-export const sameKeyset = (a: any, b: { keys: string[]; pred: string }) =>
-  !!a && a.pred === b.pred && Array.isArray(a.keys) && a.keys.length === b.keys.length
-  && a.keys.every((k: unknown) => typeof k === 'string') && [...a.keys].sort().join() === [...b.keys].sort().join();
-
-export type Keyset = { keys: string[]; pred: string };
-// The backfill keyset is permanent once claimed, so a malformed one must never reach a command. Pact
-// treats a keys-all over no keys as always satisfied (anyone could backfill) and keys-2 over one key
-// as never satisfiable (backfill dead forever). Throws naming the problem.
-export function validateKeyset(ks: any): Keyset {
-  if (!ks || typeof ks !== 'object' || !Array.isArray(ks.keys)) throw new Error('keyset-shape: must be {"keys": [...], "pred": "..."}');
-  const extra = Object.keys(ks).filter((k) => k !== 'keys' && k !== 'pred');
-  if (extra.length) throw new Error(`keyset-field: unexpected field(s) ${extra.join(', ')}`);
-  if (!['keys-all', 'keys-any', 'keys-2'].includes(ks.pred)) throw new Error(`keyset-pred: pred must be keys-all, keys-any or keys-2, got ${JSON.stringify(ks.pred)}`);
-  if (ks.keys.length === 0) throw new Error('keyset-empty: it has no keys, and Pact would let anyone satisfy it');
-  if (!ks.keys.every((k: unknown) => typeof k === 'string' && /^[0-9a-f]{64}$/.test(k))) throw new Error('keyset-hex: every key must be 64 lower-case hex characters');
-  if (new Set(ks.keys).size !== ks.keys.length) throw new Error('keyset-repeat: a key is listed twice');
-  if (ks.pred === 'keys-2' && ks.keys.length < 2) throw new Error('keyset-threshold: keys-2 needs at least two keys');
-  return { keys: ks.keys, pred: ks.pred };
-}
 
 export type Emitted = { cmd: string; hash: string; sigs: ({ pubKey?: string; sig?: string } | null)[] };
 export type Signed = { cmd: string; hash: string; sigs: { sig: string }[] };
 
-// The ONE builder for the deploy's commands: deploy.ts writes with it, and signGasSlot rebuilds with it
+// The ONE builder for the deploy's command: deploy.ts writes with it, and signGasSlot rebuilds with it
 // to demand the exact same bytes. The nonce is derived from the chain and the creation time, so the
 // rebuild reproduces it exactly and a file cannot carry any other text there.
 export function buildUnsignedGasOnly(s: {
@@ -255,8 +236,8 @@ export function buildUnsignedGasOnly(s: {
 }
 
 // `now` is the target chain's own time in seconds: a command is signed only while that chain would accept it.
-export type DeployExpect = { networkId: string; ns: string; source: string; keyset: Keyset | null; gasPrice: number; now: number };
-export type GasSigned = { signed: Signed; kind: 'keyset' | 'module'; chainId: ChainId; fee: number };
+export type DeployExpect = { networkId: string; ns: string; source: string; gasPrice: number; now: number };
+export type GasSigned = { signed: Signed; chainId: ChainId; fee: number };
 const fail: (code: string, msg: string) => never = (code, msg) => { throw new Error(`${code}: ${msg}`); };
 
 // A command file's own integrity, checked before the node is asked anything about it: its hash is the
@@ -281,14 +262,10 @@ export function statusDecision(prior: ICommandResult | undefined): 'go' | 'skip'
   return !prior ? 'go' : prior.result?.status === 'success' ? 'skip' : 'fail';
 }
 
-// What the deploy's two commands must carry besides their code, for the gas-key signer and for commands
-// signed elsewhere alike. Both need the configured backfill keyset: the keyset command must carry exactly
-// it, and a module command is sent only on a chain where it is already defined.
-function checkContent(kind: 'keyset' | 'module', data: any, x: Pick<DeployExpect, 'ns' | 'keyset'>): void {
-  if (!x.keyset) fail('content-keyset-missing', 'no backfill keyset is configured (BH_BACKFILL_KEYSET): the keyset command must carry it, and a module command is sent only where it is already on chain');
-  try { validateKeyset(x.keyset); } catch (e: any) { fail('content-keyset-invalid', `the configured backfill keyset is invalid — ${e?.message ?? e}`); }
-  if (kind === 'keyset' && (!data || !sameKeyset(data.ks, x.keyset!))) fail('content-keyset', 'the keyset in this command is not the configured backfill keyset');
-  if (kind === 'module' && (!data || data.ns !== x.ns)) fail('content-module', `the module command's namespace must be "${x.ns}"`);
+// What the module command must carry besides its code, for the gas-key signer and for commands signed
+// elsewhere alike: {"ns": BH_NS}, so the module lands in the namespace this run targets.
+function checkContent(data: any, ns: string): void {
+  if (!data || data.ns !== ns) fail('content-module', `the module command's namespace must be "${ns}"`);
 }
 
 // Signs the gas payer's slot of ONE emitted deploy command, or throws naming the guard that refused.
@@ -317,29 +294,19 @@ export function signGasSlot(tx: Emitted, gasKey: { secretKey: string; publicKey?
   if (!Number.isInteger(ct) || ct <= 0) fail('creation-time', `not a positive whole number of seconds: ${JSON.stringify(ct)}`);
   if (!(Number.isFinite(x.now) && ct >= x.now - 28800 && ct <= x.now + 60)) fail('creation-time-window', `created at ${ct}, outside the 8 hours before this chain's time ${x.now} — rebuild the file`);
   if (typeof cmd.nonce !== 'string') fail('nonce', 'the nonce must be a string');
-  const code = cmd.payload?.exec?.code;
-  const data = cmd.payload?.exec?.data;
-  let kind: 'keyset' | 'module', limit: number, expectData: Record<string, any>;
-  if (code === keysetDeployCode(x.ns)) {
-    checkContent('keyset', data, x);
-    kind = 'keyset'; limit = KEYSET_GAS_LIMIT; expectData = { ks: x.keyset };
-  } else if (code === x.source) {
-    checkContent('module', data, x);
-    kind = 'module'; limit = MODULE_GAS_LIMIT; expectData = { ns: x.ns };
-  } else {
-    fail('content-shape', 'neither the backfill keyset definition nor the exact module source — refusing to sign');
-  }
-  if (cmd.meta.gasLimit !== limit!) fail('gas-limit', `${JSON.stringify(cmd.meta.gasLimit)}, expected exactly ${limit!} for this command`);
+  if (cmd.payload?.exec?.code !== x.source) fail('content-shape', 'not the exact module source — refusing to sign');
+  checkContent(cmd.payload.exec.data, x.ns);
+  if (cmd.meta.gasLimit !== MODULE_GAS_LIMIT) fail('gas-limit', `${JSON.stringify(cmd.meta.gasLimit)}, expected exactly ${MODULE_GAS_LIMIT}`);
   // The catch-all: rebuild from what the command must contain; no field this function does not name
   // (ttl, an extra key, a continuation, verifiers, a signer scheme, …) can ride along.
   const rebuilt = buildUnsignedGasOnly({
-    code, data: expectData!, chainId: chainId as ChainId, sender: `k:${pub}`, signerPubKey: pub, gasLimit: limit!, gasPrice: x.gasPrice,
+    code: x.source, data: { ns: x.ns }, chainId, sender: `k:${pub}`, signerPubKey: pub, gasLimit: MODULE_GAS_LIMIT, gasPrice: x.gasPrice,
     creationTime: ct, networkId: x.networkId,
   });
-  if (rebuilt.cmd !== tx.cmd) fail('exact', 'the command differs from the one the deploy tool writes for this content');
+  if (rebuilt.cmd !== tx.cmd) fail('exact', 'the command differs from the one the deploy tool writes');
   const sig = signHash(tx.hash, { publicKey: pub, secretKey: gasKey.secretKey }).sig;
   if (!sig || !verifySig(base64UrlDecodeArr(tx.hash), hexToBin(sig), hexToBin(pub))) fail('signature', 'it did not verify');
-  return { signed: { cmd: tx.cmd, hash: tx.hash, sigs: [{ sig: sig! }] }, kind: kind!, chainId: chainId as ChainId, fee: limit! * x.gasPrice };
+  return { signed: { cmd: tx.cmd, hash: tx.hash, sigs: [{ sig: sig! }] }, chainId, fee: MODULE_GAS_LIMIT * x.gasPrice };
 }
 
 // The body a check-only preflight sends: the command and its signer slots with NO signature. Built from
@@ -356,12 +323,12 @@ export function preflightRequest(tx: Signed, send: boolean): { body: Emitted | S
   return send ? { body: tx, signatureVerification: true } : { body: unsignedBody(tx), signatureVerification: false };
 }
 
-// Which of the deploy's two commands a command is, by its code alone; 'other' for anything else, such as
-// a backfill batch. Commands signed elsewhere are deduplicated and gated by it too (through relayKind).
-export function commandKind(cmdText: string, ns: string, source: string): 'keyset' | 'module' | 'other' {
+// Whether a command is the deploy's module command, by its code alone; 'other' for anything else. Commands
+// signed elsewhere are deduplicated and gated by it too (through relayKind).
+export function commandKind(cmdText: string, source: string): 'module' | 'other' {
   let code: unknown;
   try { code = JSON.parse(cmdText)?.payload?.exec?.code; } catch { return 'other'; }
-  return code === keysetDeployCode(ns) ? 'keyset' : code === source ? 'module' : 'other';
+  return code === source ? 'module' : 'other';
 }
 
 // A module, interface or keyset definition anywhere in Pact code. Pact allows whitespace and comments
@@ -370,16 +337,30 @@ export function commandKind(cmdText: string, ns: string, source: string): 'keyse
 // mention of it counts; a false match only refuses.
 const DEFINITION = /\((?:\s|;[^\n]*\n)*(?:module|interface)\b|define-keyset/;
 
-// For commands signed elsewhere: commandKind, or a throw naming why it cannot be sent. The deploy's two
-// commands must carry what the gas-key signer demands of them. Any other module, interface or keyset
-// definition is refused: the rule that a module goes only where the backfill keyset is ours knows only
-// this checkout's module, and the keyset check only the deploy's own keyset command.
-export function relayKind(cmdText: string, x: Pick<DeployExpect, 'ns' | 'source' | 'keyset'>): 'keyset' | 'module' | 'other' {
-  let exec: any;
-  try { exec = JSON.parse(cmdText)?.payload?.exec; } catch { /* not JSON: verifySigned refuses it */ }
-  const kind = commandKind(cmdText, x.ns, x.source);
-  if (kind !== 'other') checkContent(kind, exec?.data, x);
-  else if (typeof exec?.code === 'string' && DEFINITION.test(exec.code)) fail('content-definition', 'it defines a module, interface or keyset, and is not exactly one of the deploy\'s two commands');
+// For commands signed elsewhere: commandKind, or a throw naming why it cannot be sent. The command must be
+// exactly the JSON the tools write, checked here too so this gate holds without fileChain: a repeated key
+// could make this parser and the node read different code from the same text. The module command must
+// carry what the gas-key signer demands of it. Any other module, interface or keyset definition is
+// refused: this tool carries this checkout's module, and nothing else that claims a name.
+export function relayKind(cmdText: string, x: Pick<DeployExpect, 'ns' | 'source'>): 'module' | 'other' {
+  let cmd: any;
+  try { cmd = JSON.parse(cmdText); } catch { fail('format-json', 'the command is not JSON'); }
+  if (JSON.stringify(cmd) !== cmdText) fail('format-exact', 'the command is not in the exact form the tools write, so this tool and the node could read different commands from it');
+  const exec = cmd?.payload?.exec;
+  const kind = commandKind(cmdText, x.source);
+  if (kind === 'module') checkContent(exec?.data, x.ns);
+  else if (typeof exec?.code === 'string' && DEFINITION.test(exec.code)) fail('content-definition', 'it defines a module, interface or keyset, and is not exactly the deploy\'s module command');
+  return kind;
+}
+
+// What a command already on chain must be for a run to skip it without signing: one this run would have
+// sent. With --gas-key that is the deploy's module command alone, the only command that mode signs;
+// without it, any command relayKind accepts. Anything else means the chain holds something this deploy
+// did not intend, and the run stops to say so. Signatures and creation time are not judged: the chain
+// has already accepted both. Returns the kind, or throws naming why.
+export function spentKind(cmdText: string, x: Pick<DeployExpect, 'ns' | 'source'>, withGasKey: boolean): 'module' | 'other' {
+  const kind = relayKind(cmdText, x);
+  if (withGasKey && kind !== 'module') fail('spent-other', 'it is not the deploy\'s module command, the only command --gas-key signs');
   return kind;
 }
 

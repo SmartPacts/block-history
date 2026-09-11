@@ -3,12 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Deploy, feed, backfill and verify the block-history module on a Chainweb network.",
+  "description": "Deploy, feed and verify the block-history module on a Chainweb network.",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "deploy": "tsx src/deploy.ts",
     "feeder": "tsx src/feeder.ts",
-    "backfill": "tsx src/backfill.ts",
     "oracle": "tsx src/oracle.ts",
     "test-tools": "tsx src/tools-check.ts",
     "send-signed": "tsx src/send-signed.ts",
