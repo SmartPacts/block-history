@@ -110,7 +110,7 @@ Each release lists its commit, the module hash and the sha256 of the module sour
 | Item | Value |
 |---|---|
 | Module hash (identical on all 20 chains) | `P3J_LK-Wivmuyw7SB7TzPmfj6t-GCtG3YnfHNAaU2UU` |
-| Deploy gas per chain | 4,199 |
+| Deploy gas per chain | 4,202 |
 | `attest` gas on a node | 191 on average over 271 sampled mined transactions, 0 failed |
 | `attest` in the REPL gas model (record / duplicate no-op) | 87 / 15 |
 | Feeder soak, 6 min, 20 chains | 6,523 events, 6,523 submitted, 0 submit errors, 0 reconnects |
