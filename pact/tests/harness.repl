@@ -1,27 +1,28 @@
-;; harness.repl — the world every suite loads: a namespace, the backfill keyset, the module.
+;; harness.repl — the world every suite loads: a namespace shaped like mainnet `free`, and
+;; the module deployed into it.
+;;
+;; The namespace. Mainnet `free` lets anyone define names in it: its user guard is
+;; permissive. Here the user guard is open and the admin guard is closed, so nothing below
+;; can lean on namespace administration. No keyset is defined anywhere and the deploy
+;; carries no signature: the module needs neither.
 ;;
 ;; Block simulation. (env-chain-data …) MERGES into the previous public data, so a suite
 ;; must always set height, prev-block-hash and block-time TOGETHER or it tests a chain
 ;; state that cannot exist. Convention used by every suite:
 ;;   height N   ->  prev-block-hash "H<N-1>"   block-time = EPOCH + (N-1) seconds
-;; i.e. the record of height h is {hash "H<h>", time EPOCH + h s}.
-;; Keys: 43-char hashes are only needed where `valid-hash` is on the path (backfill);
-;; attest stores whatever the engine hands it, so short test hashes are fine there.
+;; i.e. the record of height h is {hash "H<h>", time EPOCH + h s}. Test hashes are short:
+;; attest stores whatever the engine hands it and refuses only an empty one.
 
-(env-data { "ns": "free"
-          , "backfill-ks": { "keys": ["0000000000000000000000000000000000000000000000000000000000000bac"], "pred": "keys-all" }
-          , "ns-admin":    { "keys": ["0000000000000000000000000000000000000000000000000000000000000ad0"], "pred": "keys-all" } })
+(env-data { "ns": "free" })
+(env-sigs [])
 (begin-tx)
 (module test-ns GOVERNANCE
-  (defcap GOVERNANCE () (enforce-guard (read-keyset "ns-admin")))
-  (defconst NS-GUARD (create-user-guard (succeed)))
-  (defun succeed () true))
-(define-namespace "free" test-ns.NS-GUARD test-ns.NS-GUARD)
-(commit-tx)
-
-(begin-tx)
-(namespace "free")
-(define-keyset "free.block-history-backfill" (read-keyset "backfill-ks"))
+  (defcap GOVERNANCE () (enforce false "test-ns: test scaffolding, never upgraded"))
+  (defun open-guard () true)
+  (defun closed-guard () (enforce false "test-ns: nobody administers this namespace"))
+  (defconst USER-GUARD (create-user-guard (open-guard)))
+  (defconst ADMIN-GUARD (create-user-guard (closed-guard))))
+(define-namespace "free" test-ns.USER-GUARD test-ns.ADMIN-GUARD)
 (commit-tx)
 
 ;; Deployed at height 1000: the deploy transaction itself sees block 999 as previous.
@@ -31,4 +32,4 @@
 (load "../modules/block-history.pact")
 (commit-tx)
 (env-data {})
-(print "harness ready: free.block-history deployed at height 1000, backfill keyset ...0bac")
+(print "harness ready: free.block-history deployed at height 1000, unsigned, no keyset anywhere")

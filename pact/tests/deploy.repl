@@ -1,0 +1,49 @@
+;; deploy.repl — what a deploy into mainnet's `free` namespace rests on. Scored by EXIT CODE.
+;;
+;; The harness builds the world these facts are about: a namespace whose user guard is
+;; open (mainnet `free` has a permissive user guard, so anyone may define names in it) and
+;; whose admin guard is closed, no keyset anywhere, and the module deployed unsigned.
+;;
+;;   D1  The module needs no keyset and no signature to deploy: it is live in that world.
+;;   D2  The deploy leaned only on the namespace's USER guard: the admin guard really is
+;;       closed, and the user guard really admits an unsigned stranger.
+;;   D3  Every public function runs with no signature.
+;;   D4  A later deploy of the same name is refused, as immutable. A module form cannot sit
+;;       inside expect-failure, so frozen.repl-must-fail is that proof; run.sh checks it is
+;;       refused by the governance, and that the same file goes through once governance can
+;;       be satisfied.
+(load "harness.repl")
+(defconst EPOCH (time "1970-01-01T00:00:00Z"))
+(env-sigs [])
+
+;; ---- D1 ----------------------------------------------------------------------------
+(expect "D1 the module is live though the world defines no keyset and the deploy was unsigned"
+  "free.block-history" (at 'name (describe-module "free.block-history")))
+
+;; ---- D2 ----------------------------------------------------------------------------
+(begin-tx)
+(expect-failure "D2 the namespace's admin guard is closed, so the deploy did not use it"
+  "test-ns: nobody administers this namespace"
+  (define-namespace "free" test-ns.USER-GUARD test-ns.USER-GUARD))
+(rollback-tx)
+(begin-tx)
+(expect "D2b the user guard admits an unsigned stranger" "Namespace set to free" (namespace "free"))
+(rollback-tx)
+
+;; ---- D3 ----------------------------------------------------------------------------
+(env-chain-data { "chain-id": "2", "block-height": 1001, "prev-block-hash": "H1000"
+                , "block-time": (add-time EPOCH 1000), "sender": "anyone" })
+(begin-tx)
+(expect "D3 attest" "recorded" (free.block-history.attest))
+(expect "D3b get-attested" { "hash": "H1000", "time": (add-time EPOCH 1000), "by": "anyone" }
+  (free.block-history.get-attested 1000))
+(expect "D3c hash-of" "H1000" (free.block-history.hash-of 1000))
+(expect "D3d time-of" (add-time EPOCH 1000) (free.block-history.time-of 1000))
+(expect "D3e has-attested" true (free.block-history.has-attested 1000))
+(expect "D3f latest" { "height": 1000, "hash": "H1000", "time": (add-time EPOCH 1000) }
+  (free.block-history.latest))
+(expect "D3g chain" "2" (free.block-history.chain))
+(expect "D3h key" "000000001000" (free.block-history.key 1000))
+(commit-tx)
+
+(print "deploy.repl: OK")

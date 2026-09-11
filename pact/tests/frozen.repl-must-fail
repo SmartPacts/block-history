@@ -1,9 +1,12 @@
 ;; frozen.repl-must-fail — the engine must REFUSE this file, and refuse it because the
 ;; module is immutable. A load that succeeds means governance can be satisfied and the
 ;; whole record can be rewritten. Asserted by run.sh: exit code non-zero AND the reason.
+;; run.sh also loads this same file against a copy of the module whose governance CAN be
+;; satisfied and requires it to go through there, so the refusal here is the governance
+;; and nothing else in this file.
 ;;
-;; The redefinition runs in its own transaction, after the deploy has committed, as any
-;; real upgrade would.
+;; This is a later deploy of the same name into the same open namespace, in its own
+;; transaction after the first deploy has committed, as any real one would be.
 (load "harness.repl")
 
 (env-chain-data { "chain-id": "2", "block-height": 1001, "prev-block-hash": "H1000"
@@ -12,10 +15,7 @@
 (free.block-history.attest)
 (commit-tx)
 
-;; An "upgrade" that would let anyone rewrite history. Every key in the world signs.
-(env-data { "ns": "free" })
-(env-sigs [ { "key": "0000000000000000000000000000000000000000000000000000000000000bac", "caps": [] }
-          , { "key": "0000000000000000000000000000000000000000000000000000000000000ad0", "caps": [] } ])
+;; A redeploy that would let anyone rewrite history.
 (begin-tx)
 (namespace "free")
 (module block-history GOVERNANCE

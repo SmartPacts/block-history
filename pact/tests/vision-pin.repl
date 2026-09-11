@@ -1,78 +1,100 @@
 ;; vision-pin.repl — the tests that go RED if the vision is violated. Scored by EXIT CODE.
 ;;
-;; The vision: an attested row is unforgeable and can never be confused with a
-;; backfilled one; a recorded hash can never be revised. Each pin below is proven
-;; load-bearing by run.sh, which builds three mutants of the module and requires this
-;; file to FAIL against every one of them:
-;;   mutant-fallback     get-attested silently falls back to the backfilled table
-;;   mutant-shadow       backfill no longer refuses an already-attested height
-;;   mutant-rewrite      attest overwrites instead of refusing a second recording
-;; A module path may be passed via env-data "module" so the mutants load in place.
-(env-data { "ns": "free"
-          , "backfill-ks": { "keys": ["0000000000000000000000000000000000000000000000000000000000000bac"], "pred": "keys-all" }
-          , "ns-admin":    { "keys": ["0000000000000000000000000000000000000000000000000000000000000ad0"], "pred": "keys-all" } })
-(begin-tx)
-(module test-ns GOVERNANCE
-  (defcap GOVERNANCE () (enforce-guard (read-keyset "ns-admin")))
-  (defconst NS-GUARD (create-user-guard (succeed)))
-  (defun succeed () true))
-(define-namespace "free" test-ns.NS-GUARD test-ns.NS-GUARD)
-(namespace "free")
-(define-keyset "free.block-history-backfill" (read-keyset "backfill-ks"))
-(commit-tx)
-(env-chain-data { "chain-id": "2", "block-height": 1000, "prev-block-hash": "H999"
-                , "block-time": (add-time (time "1970-01-01T00:00:00Z") 999), "sender": "deployer" })
-(begin-tx)
-(load "../modules/block-history.pact")
-(commit-tx)
-(env-data {})
+;; The vision: every row is the engine's own account of a block, written by the one
+;; function that writes, which takes no arguments; a caller decides only WHETHER a row is
+;; written, never what it says; a recorded height is final; the code can never change.
+;; run.sh builds one mutant of the module per clause and requires this file to FAIL
+;; against each, for the reason named beside it:
+;;   caller-value   attest takes the hash from transaction data    VISION-1a: the caller's hash landed
+;;   takes-arg      attest takes the hash as an argument           VISION-2: the call with an argument recorded
+;;   rewrite        a second recording overwrites the first        VISION-3: the read-only probe hit a write
+;;   abort-dup      a second recording aborts                      VISION-3: the probe caught an abort
+;;   gov-open       governance can be satisfied                    VISION-4: module admin was granted
+;;   second-writer  a read function also writes a row              VISION-5: the read-only probe hit a write
+;; The upgrade half of VISION-4 is frozen.repl-must-fail; the static half of VISION-5 is
+;; run.sh's DML inventory. run.sh checks both against the same mutants.
+(load "harness.repl")
 (defconst EPOCH (time "1970-01-01T00:00:00Z"))
-(defconst H43 "QqNvtjXzPCn8J1UD_MicQvSQs8ogzAIGfAIe9boWC9s")
 
-;; ---- VISION-1: a backfilled row is NEVER served as attested -------------------
-(env-sigs [ { "key": "0000000000000000000000000000000000000000000000000000000000000bac", "caps": [ (free.block-history.BACKFILL) ] } ])
-(env-data { "rows": [ { "height": 500, "hash": H43, "time": { "time": "1970-01-01T00:08:20Z" } } ] })
-(begin-tx)
-(free.block-history.backfill (read-msg 'rows))
-(commit-tx)
-(env-sigs [])
-(begin-tx)
-(expect "VISION-1 the row exists as backfilled" true (free.block-history.has-backfilled 500))
-(expect-failure "VISION-1a get-attested refuses a backfilled height" "No value found in table free.block-history_attested"
-  (free.block-history.get-attested 500))
-(expect-failure "VISION-1b hash-of refuses a backfilled height" "No value found in table free.block-history_attested"
-  (free.block-history.hash-of 500))
-(expect "VISION-1c get-block says so out loud" "backfilled" (at 'source (free.block-history.get-block 500)))
-(commit-tx)
+;; Throughout this file the transaction data offers caller-chosen values under the names a
+;; row has. None of them may ever land.
+(env-data { "hash": "CALLER-HASH", "by": "caller", "height": 5 })
 
-;; ---- VISION-2: an attested height can never be shadowed by a backfill ----------
+;; ---- VISION-1: a row is exactly what the engine handed attest --------------------
 (env-chain-data { "chain-id": "2", "block-height": 1001, "prev-block-hash": "H1000"
                 , "block-time": (add-time EPOCH 1000), "sender": "bot" })
 (begin-tx)
-(free.block-history.attest)
+(expect "VISION-1 attest records" "recorded" (free.block-history.attest))
+(expect "VISION-1a the row is the engine's prev-block-hash, block-time and sender, at block-height - 1"
+  { "hash": "H1000", "time": (add-time EPOCH 1000), "by": "bot" }
+  (free.block-history.get-attested 1000))
+(expect "VISION-1b latest holds the engine's values too"
+  { "height": 1000, "hash": "H1000", "time": (add-time EPOCH 1000) }
+  (free.block-history.latest))
+(expect "VISION-1c the event carries the engine's values"
+  [ [1000 "H1000" (add-time EPOCH 1000) "bot"] ]
+  (map (at 'params) (env-events true)))
+(expect "VISION-1d the caller-chosen height got nothing" false (free.block-history.has-attested 5))
 (commit-tx)
-(env-chain-data { "chain-id": "2", "block-height": 1010, "prev-block-hash": "H1009"
-                , "block-time": (add-time EPOCH 1009), "sender": "op" })
-(env-sigs [ { "key": "0000000000000000000000000000000000000000000000000000000000000bac", "caps": [ (free.block-history.BACKFILL) ] } ])
-(env-data { "rows": [ { "height": 1000, "hash": H43, "time": { "time": "1970-01-01T00:16:40Z" } } ] })
-(begin-tx)
-(expect-failure "VISION-2 the operator cannot write over an attested height" "block-history: backfill: height is already attested"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(env-sigs [])
-(env-data {})
-(expect "VISION-2a the engine's value stands" "H1000" (free.block-history.hash-of 1000))
-(expect "VISION-2b and it is not ALSO backfilled" false (free.block-history.has-backfilled 1000))
 
-;; ---- VISION-3: a recorded hash is final — a later block cannot revise it ----------
-;; The engine could never hand a different prev-block-hash for the same height on one
-;; fork; this simulates a module that lets it through. The first value must stand.
+;; ---- VISION-2: attest takes no arguments, so a caller cannot hand it a value -------
+(begin-tx)
+(expect-failure "VISION-2 attest refuses an argument" "Attempted to apply a closure to too many arguments"
+  (free.block-history.attest "CALLER-HASH"))
+(rollback-tx)
+
+;; ---- VISION-3: a recorded height is final; a second recording is a pure no-op ------
+;; The engine can never hand a different prev-block-hash for one height on one fork; this
+;; hands one anyway, from a different sender. `try` runs attest read-only: the no-op must
+;; return its answer without aborting (else `try` yields "ABORTED") and without writing
+;; (a write in read-only mode is an error `try` does not catch, so the expectation fails).
 (env-chain-data { "chain-id": "2", "block-height": 1001, "prev-block-hash": "FORGED-1000"
                 , "block-time": (add-time EPOCH 1000), "sender": "mallory" })
 (begin-tx)
-(expect "VISION-3 a second recording of the same height is a no-op" "already recorded" (free.block-history.attest))
-(commit-tx)
+(expect "VISION-3 a second recording returns, never aborts, never writes" "already recorded"
+  (try "ABORTED" (free.block-history.attest)))
 (expect "VISION-3a the first value stands" "H1000" (free.block-history.hash-of 1000))
 (expect "VISION-3b the first recorder stands" "bot" (at 'by (free.block-history.get-attested 1000)))
+(expect "VISION-3c no event" [] (env-events true))
+(commit-tx)
+
+;; ---- VISION-4: the code can never change ------------------------------------------
+;; Module admin is what an upgrade and a direct table write both need; governance must
+;; never grant it. (A plain external write is refused by the engine even with governance
+;; open, so negatives.repl covers those; this pins the part only governance holds.)
+(begin-tx)
+(expect-failure "VISION-4 module admin can never be acquired" "block-history is immutable: it can never be upgraded"
+  (acquire-module-admin free.block-history))
+(rollback-tx)
+(begin-tx)
+(expect-failure "VISION-4a so nobody can acquire it and then rewrite a row" "block-history is immutable: it can never be upgraded"
+  (let ((admin (acquire-module-admin free.block-history)))
+    (write free.block-history.attested "000000001000" { "hash": "FORGED", "time": EPOCH, "by": "mallory" })))
+(expect "VISION-4b the row stands" "H1000" (free.block-history.hash-of 1000))
+(rollback-tx)
+
+;; ---- VISION-5: attest is the only function that writes -----------------------------
+;; `try` runs its body read-only, and a write there is an error it does not catch. Every
+;; other public function runs inside one and must return its ordinary answer; a function
+;; that writes fails its expectation instead.
+(begin-tx)
+(expect "VISION-5 get-attested writes nothing" { "hash": "H1000", "time": (add-time EPOCH 1000), "by": "bot" }
+  (try "ABORTED" (free.block-history.get-attested 1000)))
+(expect "VISION-5 hash-of writes nothing" "H1000" (try "ABORTED" (free.block-history.hash-of 1000)))
+(expect "VISION-5 time-of writes nothing" (add-time EPOCH 1000) (try "ABORTED" (free.block-history.time-of 1000)))
+(expect "VISION-5 has-attested writes nothing" true (try "ABORTED" (free.block-history.has-attested 1000)))
+(expect "VISION-5 latest writes nothing" { "height": 1000, "hash": "H1000", "time": (add-time EPOCH 1000) }
+  (try "ABORTED" (free.block-history.latest)))
+(expect "VISION-5 chain writes nothing" "2" (try "ABORTED" (free.block-history.chain)))
+(expect "VISION-5 key writes nothing" "000000001000" (try "ABORTED" (free.block-history.key 1000)))
+(commit-tx)
+;; Control: the probe does see a write. attest on a height not yet recorded is refused in it.
+(env-chain-data { "chain-id": "2", "block-height": 1002, "prev-block-hash": "H1001"
+                , "block-time": (add-time EPOCH 1001), "sender": "bot" })
+(begin-tx)
+(expect-failure "VISION-5 control: the read-only probe refuses attest's write" "Operation disallowed in read-only or sys-only mode"
+  (try "ABORTED" (free.block-history.attest)))
+(expect "VISION-5 control: and nothing landed" false (free.block-history.has-attested 1001))
+(rollback-tx)
 
 (print "vision-pin.repl: OK")

@@ -4,36 +4,31 @@
 
 (defconst EPOCH (time "1970-01-01T00:00:00Z"))
 
-;; ---- P1 empty world -----------------------------------------------------------
+;; ---- P1 empty world: nothing is recorded until someone attests --------------------
 (begin-tx)
-(expect "P1 nothing attested yet" false (free.block-history.has-attested 999))
-(expect "P1b nothing backfilled yet" false (free.block-history.has-backfilled 999))
-(expect "P1c has-block is false for an unknown height" false (free.block-history.has-block 999))
-(expect "P1d latest is the empty sentinel" { "height": -1, "hash": "", "time": EPOCH }
+(expect "P1 a block from before the first attest is absent" false (free.block-history.has-attested 999))
+(expect "P1b latest is the empty sentinel" { "height": -1, "hash": "", "time": EPOCH }
   (free.block-history.latest))
-(expect "P1e backfill window opens open" { "open": true, "closed-at": -1 }
-  (free.block-history.backfill-status))
-(expect "P1f chain is the engine's chain-id" "2" (free.block-history.chain))
+(expect "P1c chain is the engine's chain-id" "2" (free.block-history.chain))
 (commit-tx)
 
 ;; ---- P2 attest records exactly the previous block from engine values ------------
 (env-chain-data { "chain-id": "2", "block-height": 1001, "prev-block-hash": "H1000"
                 , "block-time": (add-time EPOCH 1000), "sender": "bot-a" })
+(env-sigs [])
 (begin-tx)
-(expect "P2 first attestation in a block records" "recorded" (free.block-history.attest))
+(expect "P2 an unsigned attest records" "recorded" (free.block-history.attest))
 (expect "P2b the row is the engine's prev-block-hash, block-time and sender"
   { "hash": "H1000", "time": (add-time EPOCH 1000), "by": "bot-a" }
   (free.block-history.get-attested 1000))
 (expect "P2c hash-of reads the attested hash" "H1000" (free.block-history.hash-of 1000))
 (expect "P2d time-of reads the attested time" (add-time EPOCH 1000) (free.block-history.time-of 1000))
 (expect "P2e has-attested" true (free.block-history.has-attested 1000))
-(expect "P2f has-block" true (free.block-history.has-block 1000))
+(expect "P2f the current block is not recorded, only the previous one" false
+  (free.block-history.has-attested 1001))
 (expect "P2g latest advanced" { "height": 1000, "hash": "H1000", "time": (add-time EPOCH 1000) }
   (free.block-history.latest))
-(expect "P2h get-block tags the source"
-  { "height": 1000, "source": "attested", "hash": "H1000", "time": (add-time EPOCH 1000), "by": "bot-a" }
-  (free.block-history.get-block 1000))
-(expect "P2i the ATTESTED event carries the full record"
+(expect "P2h the ATTESTED event carries the full record"
   [ { "name": "free.block-history.ATTESTED", "params": [1000 "H1000" (add-time EPOCH 1000) "bot-a"], "module-hash": (at 'hash (describe-module "free.block-history")) } ]
   (env-events true))
 (commit-tx)
@@ -47,73 +42,50 @@
 (expect "P3c no event on a no-op" [] (env-events true))
 (commit-tx)
 
-;; ---- P4 gaps are sparse rows, never an abort: skip 1001, record 1002 --------------
+;; ---- P4 a missed block stays absent, and never blocks the next record ---------------
 (env-chain-data { "chain-id": "2", "block-height": 1003, "prev-block-hash": "H1002"
                 , "block-time": (add-time EPOCH 1002), "sender": "bot-a" })
 (begin-tx)
 (expect "P4 recording after a missed block still works" "recorded" (free.block-history.attest))
-(expect "P4b the missed height is a visible gap" false (free.block-history.has-block 1001))
+(expect "P4b the missed height stays absent" false (free.block-history.has-attested 1001))
 (expect "P4c latest is the newest attested height" 1002 (at 'height (free.block-history.latest)))
 (commit-tx)
 
-;; ---- P5 backfill fills the gap and older history into the SEPARATE table ----------
-(env-sigs [ { "key": "0000000000000000000000000000000000000000000000000000000000000bac", "caps": [ (free.block-history.BACKFILL) ] } ])
-(env-data { "rows": [ { "height": 1001, "hash": "H1001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "time": { "time": "1970-01-01T00:16:41Z" } }
-                    , { "height": 500,  "hash": "H0500bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "time": { "timep": "1970-01-01T00:08:20.123456Z" } } ] })
+;; ---- P5 the engine's time is stored exactly, to the microsecond --------------------
+;; Off the harness convention on purpose: this block's time carries a fraction.
+(env-chain-data { "chain-id": "2", "block-height": 1004, "prev-block-hash": "H1003"
+                , "block-time": (add-time EPOCH 1003.123456), "sender": "bot-a" })
 (begin-tx)
-(expect "P5 backfill writes both rows" { "written": 2, "skipped": 0 }
-  (free.block-history.backfill (read-msg 'rows)))
-(expect "P5b the gap is now backfilled, not attested"
-  { "attested": false, "backfilled": true }
-  { "attested": (free.block-history.has-attested 1001), "backfilled": (free.block-history.has-backfilled 1001) })
-(expect "P5c get-block reports the backfilled source"
-  { "height": 1001, "source": "backfilled", "hash": "H1001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "time": (add-time EPOCH 1001), "by": "bot-a" }
-  (free.block-history.get-block 1001))
-(expect "P5d microsecond times survive the round trip" "1970-01-01T00:08:20.123456Z"
-  (format-time "%Y-%m-%dT%H:%M:%S.%vZ" (at 'time (free.block-history.get-backfilled 500))))
-(expect "P5e backfill does not move latest" 1002 (at 'height (free.block-history.latest)))
-(expect "P5f BACKFILLED events, one per row"
-  [ "free.block-history.BACKFILLED" "free.block-history.BACKFILLED" ]
-  (map (at 'name) (env-events true)))
+(expect "P5 record" "recorded" (free.block-history.attest))
+(expect "P5b the microseconds survive" "1970-01-01T00:16:43.123456Z"
+  (format-time "%Y-%m-%dT%H:%M:%S.%vZ" (free.block-history.time-of 1003)))
 (commit-tx)
 
-;; ---- P6 retry safety: the same batch again is all skipped ---------------------------
+;; ---- P6 latest never moves backwards ----------------------------------------------
+;; A lower height cannot reach attest after a higher one on one fork; the REPL can stage
+;; it, and latest must hold. Rolled back: this chain state is not real.
+(env-chain-data { "chain-id": "2", "block-height": 1002, "prev-block-hash": "H1001"
+                , "block-time": (add-time EPOCH 1001), "sender": "bot-a" })
 (begin-tx)
-(expect "P6 re-sending an identical batch skips every row" { "written": 0, "skipped": 2 }
-  (free.block-history.backfill (read-msg 'rows)))
-(commit-tx)
-(env-sigs [])
-(env-data {})
+(expect "P6 a lower, unrecorded height records" "recorded" (free.block-history.attest))
+(expect "P6b latest keeps the highest height"
+  { "height": 1003, "hash": "H1003", "time": (add-time EPOCH 1003.123456) }
+  (free.block-history.latest))
+(rollback-tx)
 
-;; ---- P7 close the window: one-way -------------------------------------------------
-(env-chain-data { "chain-id": "2", "block-height": 1010, "prev-block-hash": "H1009"
-                , "block-time": (add-time EPOCH 1009), "sender": "operator" })
-(env-sigs [ { "key": "0000000000000000000000000000000000000000000000000000000000000bac", "caps": [ (free.block-history.BACKFILL) ] } ])
+;; ---- P7 key shape ----------------------------------------------------------------
 (begin-tx)
-(expect "P7 close" "closed" (free.block-history.close-backfill))
-(expect "P7b status records the closing height" { "open": false, "closed-at": 1010 }
-  (free.block-history.backfill-status))
-(expect "P7c BACKFILL-CLOSED event"
-  [ { "name": "free.block-history.BACKFILL-CLOSED", "params": [1010 "operator"], "module-hash": (at 'hash (describe-module "free.block-history")) } ]
-  (env-events true))
-(commit-tx)
-(env-sigs [])
-
-;; ---- P8 attest keeps working forever after the close ----------------------------
-(env-chain-data { "chain-id": "2", "block-height": 1011, "prev-block-hash": "H1010"
-                , "block-time": (add-time EPOCH 1010), "sender": "anyone" })
-(begin-tx)
-(expect "P8 unsigned, permissionless attest after the close" "recorded" (free.block-history.attest))
-(expect "P8b row present" "H1010" (free.block-history.hash-of 1010))
+(expect "P7 keys are 12-wide zero-padded" "000000001010" (free.block-history.key 1010))
+(expect "P7b height 0 pads fully" "000000000000" (free.block-history.key 0))
+(expect "P7c the widest allowed height is unpadded" "999999999999" (free.block-history.key 999999999999))
 (commit-tx)
 
-;; ---- P9 key shape ----------------------------------------------------------------
+;; ---- P8 chain is whichever chain the engine says it is -------------------------------
+;; Every other test runs on chain "2"; relabelling it proves chain reads the engine.
+(env-chain-data { "chain-id": "19" })
 (begin-tx)
-(expect "P9 keys are 12-wide zero-padded" "000000001010" (free.block-history.key 1010))
-(expect "P9b height 0 pads fully" "000000000000" (free.block-history.key 0))
-(expect "P9c the widest allowed height is unpadded" "999999999999" (free.block-history.key 999999999999))
-(expect "P9d a real block hash is well-formed" true
-  (free.block-history.valid-hash "QqNvtjXzPCn8J1UD_MicQvSQs8ogzAIGfAIe9boWC9s"))
+(expect "P8 chain follows the engine's chain-id" "19" (free.block-history.chain))
 (commit-tx)
+(env-chain-data { "chain-id": "2" })
 
 (print "block-history.repl: OK")

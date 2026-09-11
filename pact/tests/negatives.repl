@@ -1,17 +1,15 @@
 ;; negatives.repl — branch-complete negative coverage. Scored by EXIT CODE.
 ;;
 ;; Every `enforce` and every engine refusal reachable through the public surface is
-;; driven to FAIL here with its exact message (3-arg expect-failure, always). Each
-;; write-capable negative sits in its own (begin-tx) … (rollback-tx), so no negative
-;; leaves state behind.
+;; driven to FAIL here with its exact message (3-arg expect-failure, always), beside a
+;; positive control that passes just inside the same bound. Each write-capable negative
+;; sits in a (begin-tx) … (rollback-tx), and checks the state it must not have changed
+;; before that rollback, so no negative leaves state behind and none can hide a leak.
 ;; Enumerate the module's branches with:  grep -n "enforce" ../modules/block-history.pact
 (load "harness.repl")
 (defconst EPOCH (time "1970-01-01T00:00:00Z"))
-(defconst KEY-OK "0000000000000000000000000000000000000000000000000000000000000bac")
-(defconst KEY-WRONG "0000000000000000000000000000000000000000000000000000000000000bad")
-(defconst H43 "QqNvtjXzPCn8J1UD_MicQvSQs8ogzAIGfAIe9boWC9s")
 
-;; Seed one attested row at 1000 so "already attested" branches are reachable.
+;; Seed one attested row at 1000 so the read and integrity branches have a target.
 (env-chain-data { "chain-id": "2", "block-height": 1001, "prev-block-hash": "H1000"
                 , "block-time": (add-time EPOCH 1000), "sender": "bot" })
 (begin-tx)
@@ -19,211 +17,155 @@
 (commit-tx)
 
 ;; ============================================================================
-;; key
+;; key — a height must fit the 12-digit key: 0 <= height < 10^12
 ;; ============================================================================
 (begin-tx)
-(expect-failure "N-KEY-1 negative height" "block-history: key: height out of range"
+(expect-failure "N-KEY-1 a negative height" "block-history: key: height out of range"
   (free.block-history.key -1))
-(expect-failure "N-KEY-2 height at the width limit" "block-history: key: height out of range"
+(expect "N-KEY-1c control: height 0" "000000000000" (free.block-history.key 0))
+(expect-failure "N-KEY-2 the first height that needs 13 digits" "block-history: key: height out of range"
   (free.block-history.key 1000000000000))
-(expect-failure "N-KEY-3 reads route through the same bound" "block-history: key: height out of range"
-  (free.block-history.has-block -7))
+(expect "N-KEY-2c control: the last 12-digit height" "999999999999" (free.block-history.key 999999999999))
+;; Every read routes its height through the same bound.
+(expect-failure "N-KEY-3 get-attested" "block-history: key: height out of range"
+  (free.block-history.get-attested -1))
+(expect-failure "N-KEY-4 hash-of" "block-history: key: height out of range"
+  (free.block-history.hash-of -1))
+(expect-failure "N-KEY-5 time-of" "block-history: key: height out of range"
+  (free.block-history.time-of -1))
+(expect-failure "N-KEY-6 has-attested" "block-history: key: height out of range"
+  (free.block-history.has-attested 1000000000000))
 (commit-tx)
 
 ;; ============================================================================
 ;; attest
 ;; ============================================================================
-;; The genesis branch is reached with height 0 exactly.
+;; Genesis: block 0 has no previous block; block 1 is the first that can record (height 0).
 (env-chain-data { "chain-id": "2", "block-height": 0, "prev-block-hash": "", "block-time": EPOCH, "sender": "bot" })
 (begin-tx)
 (expect-failure "N-ATT-1 no previous block at genesis" "block-history: attest: no previous block at genesis"
   (free.block-history.attest))
 (rollback-tx)
+(env-chain-data { "chain-id": "2", "block-height": 1, "prev-block-hash": "H0", "block-time": EPOCH, "sender": "bot" })
+(begin-tx)
+(expect "N-ATT-1c control: block 1 records the genesis block" "recorded" (free.block-history.attest))
+(expect "N-ATT-1d under the all-zero key" "H0" (free.block-history.hash-of 0))
+(rollback-tx)
 
+;; An empty engine hash is refused, never stored.
 (env-chain-data { "chain-id": "2", "block-height": 2000, "prev-block-hash": "", "block-time": (add-time EPOCH 1999), "sender": "bot" })
 (begin-tx)
-(expect-failure "N-ATT-2 an empty engine hash is refused, never stored" "block-history: attest: engine supplied no previous block hash"
+(expect-failure "N-ATT-2 an empty engine hash" "block-history: attest: engine supplied no previous block hash"
+  (free.block-history.attest))
+(expect "N-ATT-2b nothing was written" false (free.block-history.has-attested 1999))
+(rollback-tx)
+(env-chain-data { "chain-id": "2", "block-height": 2000, "prev-block-hash": "H1999", "block-time": (add-time EPOCH 1999), "sender": "bot" })
+(begin-tx)
+(expect "N-ATT-2c control: the same block with a hash records" "recorded" (free.block-history.attest))
+(rollback-tx)
+
+;; The height attest records must fit the key too: block 10^12 records 999999999999, and
+;; block 10^12 + 1 is refused rather than stored under a key that breaks the numeric sort.
+(env-chain-data { "chain-id": "2", "block-height": 1000000000000, "prev-block-hash": "H999999999999"
+                , "block-time": (add-time EPOCH 999999999999), "sender": "bot" })
+(begin-tx)
+(expect "N-ATT-3c control: the last 12-digit height records" "recorded" (free.block-history.attest))
+(rollback-tx)
+(env-chain-data { "chain-id": "2", "block-height": 1000000000001, "prev-block-hash": "H1000000000000"
+                , "block-time": (add-time EPOCH 1000000000000), "sender": "bot" })
+(begin-tx)
+(expect-failure "N-ATT-3 a height that needs 13 digits" "block-history: key: height out of range"
   (free.block-history.attest))
 (rollback-tx)
-(expect "N-ATT-2b nothing was written" false (free.block-history.has-block 1999))
 
 ;; ============================================================================
-;; backfill — authority
-;; ============================================================================
-(env-chain-data { "chain-id": "2", "block-height": 1010, "prev-block-hash": "H1009", "block-time": (add-time EPOCH 1009), "sender": "op" })
-(env-data { "one": [ { "height": 500, "hash": H43, "time": { "time": "1970-01-01T00:08:20Z" } } ] })
-
-(env-sigs [])
-(begin-tx)
-(expect-failure "N-BF-AUTH-1 unsigned backfill" "Keyset failure (keys-all)"
-  (free.block-history.backfill (read-msg 'one)))
-(rollback-tx)
-
-(env-sigs [ { "key": KEY-WRONG, "caps": [ (free.block-history.BACKFILL) ] } ])
-(begin-tx)
-(expect-failure "N-BF-AUTH-2 wrong key" "Keyset failure (keys-all)"
-  (free.block-history.backfill (read-msg 'one)))
-(rollback-tx)
-
-;; A signature scoped to some OTHER capability cannot satisfy the BACKFILL keyset.
-(env-sigs [ { "key": KEY-OK, "caps": [ (free.block-history.ATTESTED 1 "x" EPOCH "y") ] } ])
-(begin-tx)
-(expect-failure "N-BF-AUTH-3 right key, signature scoped to a different capability" "Keyset failure (keys-all)"
-  (free.block-history.backfill (read-msg 'one)))
-(rollback-tx)
-
-(env-sigs [])
-(begin-tx)
-(expect-failure "N-BF-AUTH-4 unsigned close" "Keyset failure (keys-all)"
-  (free.block-history.close-backfill))
-(rollback-tx)
-(expect "N-BF-AUTH-4b window still open" true (at 'open (free.block-history.backfill-status)))
-
-;; ============================================================================
-;; backfill — row validation (signed correctly from here on)
-;; ============================================================================
-(env-sigs [ { "key": KEY-OK, "caps": [ (free.block-history.BACKFILL) ] } ])
-
-(env-data { "rows": [] })
-(begin-tx)
-(expect-failure "N-BF-1 empty batch" "block-history: backfill: no rows"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-
-;; frontier: at block 1010 attest can record 1009, so 1009 and 1010 are refused; 1008 is fine.
-(env-data { "rows": [ { "height": 1009, "hash": H43, "time": { "time": "1970-01-01T00:16:49Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-2 the height attest can record NOW is not backfillable" "block-history: backfill: height is attestable, not backfillable"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(env-data { "rows": [ { "height": 1010, "hash": H43, "time": { "time": "1970-01-01T00:16:50Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-2b the current height is not backfillable" "block-history: backfill: height is attestable, not backfillable"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(env-data { "rows": [ { "height": 1008, "hash": H43, "time": { "time": "1970-01-01T00:16:48Z" } } ] })
-(begin-tx)
-(expect "N-BF-2c positive control: one below the frontier writes" { "written": 1, "skipped": 0 }
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-
-(env-data { "rows": [ { "height": 500, "hash": "QqNvtjXzPCn8J1UD_MicQvSQs8ogzAIGfAIe9boWC9", "time": { "time": "1970-01-01T00:08:20Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-3 42-char hash" "block-history: backfill: malformed block hash"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(env-data { "rows": [ { "height": 500, "hash": "QqNvtjXzPCn8J1UD_MicQvSQs8ogzAIGfAIe9boWC9sX", "time": { "time": "1970-01-01T00:08:20Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-3b 44-char hash" "block-history: backfill: malformed block hash"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(env-data { "rows": [ { "height": 500, "hash": "QqNvtjXzPCn8J1UD_MicQvSQs8ogzAIGfAIe9boWC9=", "time": { "time": "1970-01-01T00:08:20Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-3c padding character" "block-history: backfill: malformed block hash"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(env-data { "rows": [ { "height": 500, "hash": "QqNvtjXzPCn8J1UD/MicQvSQs8ogzAIGfAIe9boWC9s", "time": { "time": "1970-01-01T00:08:20Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-3d standard-base64 slash" "block-history: backfill: malformed block hash"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(env-data { "rows": [ { "height": 500, "hash": "", "time": { "time": "1970-01-01T00:08:20Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-3e empty hash" "block-history: backfill: malformed block hash"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-
-(env-data { "rows": [ { "height": 1000, "hash": H43, "time": { "time": "1970-01-01T00:16:40Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-4 an attested height can never be backfilled (no shadowing)" "block-history: backfill: height is already attested"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(expect "N-BF-4b the attested row is intact" "H1000" (free.block-history.hash-of 1000))
-
-;; One bad row aborts the WHOLE batch: nothing from it lands.
-(env-data { "rows": [ { "height": 500, "hash": H43, "time": { "time": "1970-01-01T00:08:20Z" } }
-                    , { "height": 1000, "hash": H43, "time": { "time": "1970-01-01T00:16:40Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-5 a batch is atomic" "block-history: backfill: height is already attested"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(expect "N-BF-5b the good row of the failed batch did not land" false (free.block-history.has-backfilled 500))
-
-;; conflicting hash: write 500 once, then send a different hash for 500.
-(env-data { "rows": [ { "height": 500, "hash": H43, "time": { "time": "1970-01-01T00:08:20Z" } } ] })
-(begin-tx)
-(free.block-history.backfill (read-msg 'rows))
-(commit-tx)
-(env-data { "rows": [ { "height": 500, "hash": "ZNEp20bgd9edNIcu5OK9fDoZL8YaDbvAemzFJ1eYuS8", "time": { "time": "1970-01-01T00:08:20Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-6 a different hash for an already backfilled height" "block-history: backfill: conflicting hash for an already backfilled height"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(expect "N-BF-6b the first hash stands" H43 (at 'hash (free.block-history.get-backfilled 500)))
-
-;; wrong shape: a row missing a field, a row with a wrong type
-(env-data { "rows": [ { "height": 400, "hash": H43 } ] })
-(begin-tx)
-(expect-failure "N-BF-7 a row without a time" "Runtime typecheck failure"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(env-data { "rows": [ { "height": "400", "hash": H43, "time": { "time": "1970-01-01T00:06:40Z" } } ] })
-(begin-tx)
-(expect-failure "N-BF-8 a string height" "Runtime typecheck failure"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-
-;; ============================================================================
-;; close-backfill, then the closed-window branches
+;; reads — an absent height aborts every read except has-attested
 ;; ============================================================================
 (begin-tx)
-(free.block-history.close-backfill)
-(commit-tx)
-(begin-tx)
-(expect-failure "N-CLOSE-1 closing twice" "block-history: close-backfill: the backfill window is already closed"
-  (free.block-history.close-backfill))
-(rollback-tx)
-(env-data { "rows": [ { "height": 600, "hash": H43, "time": { "time": "1970-01-01T00:10:00Z" } } ] })
-(begin-tx)
-(expect-failure "N-CLOSE-2 backfill after the close, even correctly signed" "block-history: backfill: the backfill window is closed"
-  (free.block-history.backfill (read-msg 'rows)))
-(rollback-tx)
-(expect "N-CLOSE-2b nothing landed" false (free.block-history.has-block 600))
-(env-sigs [])
-(env-data {})
-
-;; ============================================================================
-;; reads
-;; ============================================================================
-(begin-tx)
-(expect-failure "N-RD-1 get-attested on a missing height aborts" "No value found in table free.block-history_attested for key: 000000000777"
+(expect "N-RD-0 control: has-attested answers false for an absent height" false
+  (free.block-history.has-attested 777))
+(expect-failure "N-RD-1 get-attested" "No value found in table free.block-history_attested for key: 000000000777"
   (free.block-history.get-attested 777))
-(expect-failure "N-RD-2 get-backfilled on a missing height aborts" "No value found in table free.block-history_backfilled for key: 000000000777"
-  (free.block-history.get-backfilled 777))
-(expect-failure "N-RD-3 get-block on a missing height aborts, never a default" "block-history: get-block: no record for this height"
-  (free.block-history.get-block 777))
-(expect-failure "N-RD-4 hash-of on a missing height aborts" "No value found in table free.block-history_attested for key: 000000000777"
+(expect-failure "N-RD-2 hash-of" "No value found in table free.block-history_attested for key: 000000000777"
   (free.block-history.hash-of 777))
-(expect-failure "N-RD-5 time-of on a missing height aborts" "No value found in table free.block-history_attested for key: 000000000777"
+(expect-failure "N-RD-3 time-of" "No value found in table free.block-history_attested for key: 000000000777"
   (free.block-history.time-of 777))
 (commit-tx)
 
 ;; ============================================================================
-;; governance / table integrity from OUTSIDE the module
+;; heights are integers — a decimal is refused, never truncated. A bare JSON number in
+;; transaction data is a decimal on the node, so this is what a caller who forgets
+;; {"int": n} meets.
+;; ============================================================================
+(begin-tx)
+(expect-failure "N-TY-1 key" "Runtime typecheck failure, argument is decimal , but expected type integer"
+  (free.block-history.key 1000.0))
+(expect-failure "N-TY-2 get-attested" "Runtime typecheck failure, argument is decimal , but expected type integer"
+  (free.block-history.get-attested 1000.0))
+(expect-failure "N-TY-3 hash-of" "Runtime typecheck failure, argument is decimal , but expected type integer"
+  (free.block-history.hash-of 1000.0))
+(expect-failure "N-TY-4 time-of" "Runtime typecheck failure, argument is decimal , but expected type integer"
+  (free.block-history.time-of 1000.0))
+(expect-failure "N-TY-5 has-attested" "Runtime typecheck failure, argument is decimal , but expected type integer"
+  (free.block-history.has-attested 1000.0))
+(commit-tx)
+
+;; ============================================================================
+;; immutability and table integrity from OUTSIDE the module
 ;; ============================================================================
 (begin-tx)
 (expect-failure "N-GOV-1 module admin can never be acquired" "block-history is immutable: it can never be upgraded"
   (acquire-module-admin free.block-history))
-(expect-failure "N-GOV-2 a direct external write to attested needs module admin" "Module admin necessary for operation but has not been acquired:free.block-history"
-  (write free.block-history.attested "000000001000" { "hash": "FORGED", "time": EPOCH, "by": "mallory" }))
-(expect-failure "N-GOV-3 a direct external write to backfilled" "Module admin necessary for operation but has not been acquired:free.block-history"
-  (write free.block-history.backfilled "000000000001" { "hash": "FORGED", "time": EPOCH, "by": "mallory" }))
-(expect-failure "N-GOV-4 the backfill window cannot be reopened from outside" "Module admin necessary for operation but has not been acquired:free.block-history"
-  (write free.block-history.backfill-window "window" { "open": true, "closed-at": -1 }))
-(expect-failure "N-GOV-5 BACKFILL cannot be acquired from outside the module" "Module admin necessary for operation but has not been acquired"
-  (with-capability (free.block-history.BACKFILL) true))
 (rollback-tx)
-(expect "N-GOV-6 the attested row survived every attempt" "H1000" (free.block-history.hash-of 1000))
-(expect "N-GOV-7 the window is still closed" false (at 'open (free.block-history.backfill-status)))
+
+;; Every row-writing native, on both tables, without module admin.
+(begin-tx)
+(expect-failure "N-GOV-2 insert into attested" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (insert free.block-history.attested "000000000777" { "hash": "FORGED", "time": EPOCH, "by": "mallory" }))
+(expect-failure "N-GOV-3 update attested" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (update free.block-history.attested "000000001000" { "hash": "FORGED" }))
+(expect-failure "N-GOV-4 write attested" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (write free.block-history.attested "000000001000" { "hash": "FORGED", "time": EPOCH, "by": "mallory" }))
+(expect-failure "N-GOV-5 insert into latest-tbl" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (insert free.block-history.latest-tbl "other" { "height": 5, "hash": "FORGED", "time": EPOCH }))
+(expect-failure "N-GOV-6 update latest-tbl" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (update free.block-history.latest-tbl "latest" { "height": 5 }))
+(expect-failure "N-GOV-7 write latest-tbl" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (write free.block-history.latest-tbl "latest" { "height": 5, "hash": "FORGED", "time": EPOCH }))
+(expect "N-GOV-8 the attested row is intact" { "hash": "H1000", "time": (add-time EPOCH 1000), "by": "bot" }
+  (free.block-history.get-attested 1000))
+(expect "N-GOV-9 the absent height is still absent" false (free.block-history.has-attested 777))
+(expect "N-GOV-10 latest is intact" { "height": 1000, "hash": "H1000", "time": (add-time EPOCH 1000) }
+  (free.block-history.latest))
+(rollback-tx)
+
+;; The ATTESTED event is the tamper-evident log: nothing outside the module can emit it or
+;; acquire its capability, from the top level or from another module in the same namespace.
+(begin-tx)
+(namespace "free")
+(module mallory GOVERNANCE
+  (defcap GOVERNANCE () (enforce false "mallory: never upgraded"))
+  (defun forge-event ()
+    (emit-event (free.block-history.ATTESTED 777 "FORGED" (time "1970-01-01T00:00:00Z") "mallory")))
+  (defun forge-capability ()
+    (with-capability (free.block-history.ATTESTED 777 "FORGED" (time "1970-01-01T00:00:00Z") "mallory") true))
+  (defun forge-row ()
+    (write free.block-history.attested "000000000777" { "hash": "FORGED", "time": (time "1970-01-01T00:00:00Z"), "by": "mallory" })))
+(commit-tx)
+(begin-tx)
+(env-events true)
+(expect-failure "N-EV-1 emitting ATTESTED from the top level" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (emit-event (free.block-history.ATTESTED 777 "FORGED" EPOCH "mallory")))
+(expect-failure "N-EV-2 acquiring ATTESTED from the top level" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (with-capability (free.block-history.ATTESTED 777 "FORGED" EPOCH "mallory") true))
+(expect-failure "N-EV-3 another module emitting ATTESTED" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (free.mallory.forge-event))
+(expect-failure "N-EV-4 another module acquiring ATTESTED" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (free.mallory.forge-capability))
+(expect-failure "N-GOV-11 another module writing attested" "Module admin necessary for operation but has not been acquired:free.block-history"
+  (free.mallory.forge-row))
+(expect "N-EV-5 no event escaped" [] (env-events true))
+(expect "N-GOV-12 the absent height is still absent" false (free.block-history.has-attested 777))
+(rollback-tx)
 
 (print "negatives.repl: OK")
