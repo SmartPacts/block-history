@@ -253,7 +253,13 @@ One small always-on machine with a public IPv4 address. Measured requirements:
   feeders cut blocks lost per chain per year from ≈7,458 to ≈53 for ≈31 KDA/year more gas.
 
 `ts/deploy/provision-droplet.sh` prepares a fresh Ubuntu 24.04 droplet and **stops short of
-sending**. On the droplet, as root, with `<commit>` the full commit id from the release notes:
+sending** — and **the same command is how you update**: re-run it with a newer commit and it checks
+out that commit, reinstalls from the lockfile, and **restarts the feeder if it was running**.
+Replacing files does not replace a process — node read its code at startup — so without that
+restart an update silently does nothing. Expect a short gap in recording while it restarts. Your
+key and `ts/.env` are never regenerated or overwritten.
+
+On the droplet, as root, with `<commit>` the full commit id from the release notes:
 
 ```
 curl -fsSLo provision-droplet.sh \

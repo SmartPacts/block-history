@@ -54,7 +54,11 @@ say "0. Preconditions"
 [[ "$PIN" =~ ^[0-9a-f]{40}$ ]] || die "the pin must be a full 40-character commit id, got: $PIN"
 if [ $HAVE_SYSTEMD = 0 ] && [ $IN_CONTAINER = 0 ]; then die "no systemd and not a container — unsupported host"; fi
 [ $IN_CONTAINER = 1 ] && echo "    NOTE: running in a CONTAINER (rehearsal). Firewall, swap and service steps will be skipped; SSH hardening runs only if sshd is installed."
-ok "Ubuntu ${VERSION_ID:-?}, x86_64, root"
+# Is this an update of a feeder that is currently RUNNING? Decided before anything changes, because
+# after the checkout the answer would describe the new state instead of the one to restore.
+WAS_ACTIVE=0
+if [ $HAVE_SYSTEMD = 1 ] && systemctl is-active --quiet block-history-feeder; then WAS_ACTIVE=1; fi
+ok "Ubuntu ${VERSION_ID:-?}, x86_64, root$([ $WAS_ACTIVE = 1 ] && echo ' — the feeder is RUNNING and will be restarted at the end')"
 
 # ---------------------------------------------------------------------------------------------
 say "1. Swap — a small box can spike past its RAM while installing"
@@ -246,13 +250,22 @@ install -m 644 "$APP/ts/deploy/block-history-feeder.logrotate" /etc/logrotate.d/
 logrotate -d /etc/logrotate.d/block-history-feeder >/dev/null 2>&1 || die "logrotate rejected its config"
 ok "$LOG_DIR, rotated daily, 14 days kept"
 
-say "13. The service — installed, NOT started"
+say "13. The service"
 install -m 644 "$APP/ts/deploy/block-history-feeder.service" /etc/systemd/system/block-history-feeder.service
 if [ $HAVE_SYSTEMD = 1 ]; then
   systemctl daemon-reload
   systemd-analyze verify /etc/systemd/system/block-history-feeder.service || die "systemd rejected the unit file"
-  systemctl is-enabled block-history-feeder >/dev/null 2>&1 && echo "    NOTE: already enabled (a previous run, or by hand) — left exactly as it was"
-  ok "installed and verified. Deliberately NOT enabled and NOT started."
+  if [ $WAS_ACTIVE = 1 ]; then
+    # WHAT MAKES A RE-RUN AN UPDATE. Node read its code at startup, so without this the new commit
+    # sits on disk while the old process keeps recording — an update that silently did nothing.
+    systemctl restart block-history-feeder || die "the feeder did not come back up — check: journalctl -u block-history-feeder -n 50"
+    sleep 3
+    systemctl is-active --quiet block-history-feeder || die "the feeder started and then exited — check: journalctl -u block-history-feeder -n 50"
+    ok "restarted at $HEAD and running"
+  else
+    systemctl is-enabled block-history-feeder >/dev/null 2>&1 && echo "    NOTE: already enabled (a previous run, or by hand) — left exactly as it was"
+    ok "installed and verified. Deliberately NOT enabled and NOT started."
+  fi
 else skip "systemd registration (container)"; fi
 
 # ---------------------------------------------------------------------------------------------
