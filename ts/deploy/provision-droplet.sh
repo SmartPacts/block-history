@@ -193,6 +193,15 @@ ok "typecheck and tool self-checks pass under node $NODE_VERSION"
 
 # ---------------------------------------------------------------------------------------------
 say "10. Mainnet configuration"
+# Every value below is one this script chooses, so rewriting the file is safe — except the heartbeat
+# URL, which is the operator's. A re-run that dropped it would switch the alerting off silently, and
+# the moment nobody is watching is exactly when the feeder needs a dead man's switch. So it is read
+# back out of the file that is already there and written again. Its value is never printed: whoever
+# holds it can fake this feeder's heartbeat.
+HEARTBEAT=
+if [ -f "$APP/ts/.env" ]; then
+  HEARTBEAT=$(sed -n 's/^BH_HEARTBEAT_URL=//p' "$APP/ts/.env" | tail -n 1)
+fi
 cat > "$APP/ts/.env" <<EOF
 # Written by provision-droplet.sh. The feeder reads this; the shell environment overrides it.
 BH_HOST=$MAINNET_HOST
@@ -206,9 +215,15 @@ BH_MAX_INFLIGHT=4
 BH_SAMPLE_POLL=25
 # One attest waiting per chain every 10 s: about 93 % of blocks instead of about 75 %, at about 3 times the fees.
 BH_WAITING_INTERVAL=10
+# A ping URL from an uptime service that alerts when the pings STOP. Pinged once a minute while
+# blocks are arriving; empty means nothing will tell you this feeder died. Set it, then restart the
+# service. A later re-run of this script keeps whatever is here.
+BH_HEARTBEAT_URL=$HEARTBEAT
 EOF
 chmod 644 "$APP/ts/.env"
 ok "mainnet01 via $MAINNET_HOST, namespace free, chains 0-19"
+if [ -n "$HEARTBEAT" ]; then ok "the heartbeat URL already in this file was kept (not printed)"
+else echo "    NOTE: no heartbeat URL is set, so nothing will tell you if this feeder stops. Set BH_HEARTBEAT_URL in $APP/ts/.env."; fi
 
 # ---------------------------------------------------------------------------------------------
 say "11. The feeder's signing key — generated HERE, once, never printed"
@@ -284,10 +299,20 @@ fi
 cat <<'EOF'
 
   Next, in this order:
-    1. Fund the account above on all 20 chains, then confirm:
+    1. Back up that key, and keep the copy somewhere else. It was generated here and exists
+       NOWHERE ELSE: a dead disk takes the account and its balance with it, permanently, and
+       there is no seed phrase to fall back on. From a terminal (it asks for a passphrase and
+       never echoes it):
+         cd /opt/block-history/ts && node --import tsx src/key-backup.ts save out/feeder-key.json ~/feeder-key.backup
+       Then copy that file off this machine and prove the copy opens where it will live:
+         node --import tsx src/key-backup.ts check <the copy>
+       Lose the passphrase and the backup is gone, so keep it somewhere else again.
+    2. Fund the account above on all 20 chains, then confirm:
          cd /opt/block-history/ts && sudo -u blockhistory node --import tsx src/balances.ts <that account>
-    2. Confirm the module is deployed on every chain: until it is, the feeder refuses to start.
-    3. Then start sending:
+    3. Confirm the module is deployed on every chain: until it is, the feeder refuses to start.
+    4. Set BH_HEARTBEAT_URL in /opt/block-history/ts/.env to a ping URL from an uptime service
+       that alerts when pings stop. Without it, a dead feeder is silent until someone looks.
+    5. Then start sending:
          systemctl enable --now block-history-feeder
          journalctl -u block-history-feeder -f
 EOF

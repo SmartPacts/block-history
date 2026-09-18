@@ -212,6 +212,7 @@ cd ts && npm install && npm run typecheck && npm run test-tools
 npm run deploy                    # devnet: creates + funds keys, deploys all chains, verifies one hash
 npm run stream-check -- --seconds 240   # read-only: is the node's header stream alive for every chain?
 npm run balances -- k:<account>   # read-only: KDA per chain and feeder runway; unreachable ≠ zero
+npm run key-backup -- save out/feeder-key.json feeder-key.backup   # encrypted copy; also check, restore
 npm run feeder                    # one process, all chains, SSE-driven; --duration N for a soak
 npm run oracle -- --last 600      # CONSISTENT / FAIL, coverage per chain
 npm run devnet-negatives -- --chain 2
@@ -267,6 +268,8 @@ What it does:
   commit;
 - leaves the code owned by root and only readable by an unprivileged `blockhistory` user;
 - generates the feeder key **on the droplet** (0600, never printed, never regenerated on a re-run);
+- writes `ts/.env`, keeping any `BH_HEARTBEAT_URL` already in it: a re-run must not switch the
+  alerting off silently;
 - sets the firewall to inbound SSH only;
 - turns off password SSH only when a key is installed, and checks the setting sshd will actually use
   with `sshd -T`;
@@ -287,8 +290,49 @@ journalctl -u block-history-feeder -f
 
 Started before the module is deployed, the feeder refuses on the first chain and sends nothing.
 Five failed starts in 30 minutes make systemd stop trying rather than hammer the node; clear that
-with `systemctl reset-failed block-history-feeder`. `npm run keygen -- <path>` makes a key file and
-refuses to overwrite one.
+with `systemctl reset-failed block-history-feeder`.
+
+### The key exists in exactly one place
+
+`npm run keygen -- <path>` makes a key file and refuses to overwrite one. On a server the feeder's
+key is generated there and never leaves, which is what keeps it safe — and also what makes that disk
+a single point of failure: it takes the account and its balance with it, permanently, and there is
+no seed phrase to fall back on. Make one encrypted copy and keep it somewhere else.
+
+```
+npm run key-backup -- save    out/feeder-key.json feeder-key.backup
+npm run key-backup -- check   feeder-key.backup
+npm run key-backup -- restore feeder-key.backup out/feeder-key.json
+```
+
+`save` encrypts the key file **verbatim** — the whole file, not the pair parsed out of it, so a
+restore reproduces what was saved byte for byte — under a passphrase read only from a terminal,
+never from an argument, a pipe or the environment. The crypto is Node's own, no dependency: scrypt
+(N=2^16, r=8, p=1) and AES-256-GCM, with the public key stored in the clear and bound in as
+authenticated data. Nothing is written until the blob has been decrypted again and compared to the
+key it came from; `restore` refuses to overwrite an existing file and writes mode 0600.
+
+`check` is the part that matters, because a backup nobody has restored is not a backup — it is a
+file you hope is one. It opens the blob, derives the public key from the secret inside it and
+confirms that is the key the blob names, writing nothing and printing no secret. Run it on the copy,
+where the copy lives. A blob altered by one byte fails exactly as a wrong passphrase does, and a lost
+passphrase means a lost backup: that is the trade, and it is the right way round, since a backup
+anyone can read turns one stolen file into a stolen account.
+
+### Knowing when the feeder stops
+
+Set `BH_HEARTBEAT_URL` to a ping URL from any uptime service that alerts when pings **stop** (several
+have a free tier). The feeder pings it once per 60-second report, and only when a block arrived
+during that minute — its own proof that it is reading the chain rather than merely running. Silence
+is then the alert, and it reaches you from something that did not die with the machine. Nothing else
+would: a stopped feeder simply records nothing, and a height nobody attested looks exactly like one
+it missed.
+
+It proves blocks are arriving here, not that any attest landed — `submit-errors` and the sampled
+polls in the same report are what say that. The ping has a 10-second deadline and can never throw
+into the feeder's loop, because monitoring that breaks what it monitors is worse than none; a ping
+that cannot be sent is logged once per outage, not once per report. The URL is a capability rather
+than a secret — whoever holds it can fake this feeder's heartbeat — so the feeder never prints it.
 
 ### Deploying to a network — one pass
 

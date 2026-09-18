@@ -15,7 +15,8 @@
     "stream-check": "tsx src/stream-check.ts",
     "preflight": "tsx src/preflight.ts",
     "keygen": "tsx src/keygen.ts",
-    "balances": "tsx src/balances.ts"
+    "balances": "tsx src/balances.ts",
+    "key-backup": "tsx src/key-backup.ts"
   },
   "dependencies": {
     "@kadena/client": "1.18.3",

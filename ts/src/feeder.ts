@@ -15,6 +15,8 @@
 //   BH_MAX_INFLIGHT (per chain, default 4)  BH_SAMPLE_POLL (poll 1 in N, default 25)
 //   BH_LOG_FILE (JSON lines; default none)
 //   BH_SUBMIT_HOSTS  BH_WAITING_INTERVAL (optional sending modes, both off by default; below)
+//   BH_HEARTBEAT_URL (optional; a ping URL that alerts when the pings STOP — see the dead-man's
+//     switch beside report(). Off by default: with it unset nothing tells you this feeder died.)
 //
 // Why a reactive attest can miss a block. Only block X+1 can record block X. A mining node builds
 // X+1's first template from its mempool the moment it adopts X, and adds newer transactions only when
@@ -60,6 +62,17 @@ const TTL = Number(process.env.BH_ATTEST_TTL ?? '300');
 const MAX_INFLIGHT = Number(process.env.BH_MAX_INFLIGHT ?? '4');
 const SAMPLE_POLL = Number(process.env.BH_SAMPLE_POLL ?? '25');
 const LOG_FILE = process.env.BH_LOG_FILE;
+// A ping URL from any uptime service that alerts when pings STOP. Read like the sending modes, and
+// refused here for the same reason: a URL the feeder can never reach is a switch that will never
+// fire, and the operator finds out from the alert that never came.
+const HEARTBEAT_URL = (() => {
+  const u = (process.env.BH_HEARTBEAT_URL ?? '').trim();
+  if (!u) return '';
+  try { if (/^https?:$/.test(new URL(u).protocol)) return u; } catch { /* not a URL at all */ }
+  // The value itself is not printed: anyone holding it can fake this feeder's heartbeat.
+  console.error('feeder: BH_HEARTBEAT_URL must be an http or https URL. The feeder refuses to start and has sent nothing.');
+  process.exit(1);
+})();
 const CHAINS = parseChains();
 const chainSet = new Set<string>(CHAINS);
 // The optional modes are read before the key: a value they cannot accept stops the feeder here.
@@ -95,6 +108,8 @@ function logLine(o: Record<string, any>) {
 async function preflightWorld() {
   console.log(`feeder: ${NETWORK_ID} via ${API}\n  module ${MODULE}  chains ${CHAINS.join(',')}\n  sender ${sender}  gasLimit ${GAS_LIMIT}  ttl ${TTL}s`);
   if (MODES_ON) console.log(`  modes: reactive${WAITING !== null ? `; waiting every ${WAITING}s ±${Math.round(WAITING_JITTER * 100)}%` : ''}${SUBMIT_HOSTS.length ? `; fan-out to ${SUBMIT_HOSTS.length} host${SUBMIT_HOSTS.length > 1 ? 's' : ''}: ${SUBMIT_HOSTS.join(', ')}` : ''}`);
+  // The URL is never printed, here or anywhere: whoever holds it can fake this feeder's heartbeat.
+  if (HEARTBEAT_URL) console.log('  heartbeat: one ping per 60s report, only while blocks are arriving');
   for (const c of CHAINS) {
     // Ask describe-module directly, so a feeder started before the deploy says exactly what is wrong.
     const deployed = await local(`(describe-module ${JSON.stringify(MODULE)})`, { chainId: c }).then(
@@ -230,6 +245,34 @@ async function consumeStream() {
   }
 }
 
+// ---- THE DEAD-MAN'S SWITCH (BH_HEARTBEAT_URL). Pinged once per report, and only when a header
+// arrived during that minute: the feeder's own proof that it is READING THE CHAIN, not merely
+// running. Silence then means this process, this machine, its network or its node is gone — and the
+// alert comes from somewhere that did not die with it. Nothing else says so: a stopped feeder
+// simply records nothing, and a height nobody attested looks exactly like a height it missed.
+// Be honest about what it proves: blocks are arriving here, NOT that any attest landed — that is
+// what `submit-errors` and the sampled polls in the same report are for.
+//
+// It never throws into the loop and never waits long: monitoring that can break the thing it
+// monitors is worse than no monitoring.
+let beatEvents = 0;      // headers counted when the last ping went out
+let beatFailed = false;
+async function beat() {
+  if (!HEARTBEAT_URL) return;
+  let ev = 0; for (const s of stats.values()) ev += s.events;
+  if (ev === beatEvents) return;      // no block arrived in this window: there is nothing to claim
+  beatEvents = ev;
+  try {
+    await fetch(HEARTBEAT_URL, { signal: AbortSignal.timeout(10_000) });
+    beatFailed = false;
+  } catch (e: any) {
+    // Said once per outage, not once per report: a ping that cannot be sent is worth knowing about,
+    // but it is not what this process is for.
+    if (!beatFailed) console.log(`  ! heartbeat ping failed (${String(e?.message ?? e).slice(0, 80)}) — the feeder keeps running`);
+    beatFailed = true;
+  }
+}
+
 function report() {
   const up = Math.round((Date.now() - started) / 1000);
   let ev = 0, sub = 0, err = 0, pk = 0, pf = 0, gs = 0, ws = 0;
@@ -248,7 +291,7 @@ function report() {
 
 async function main() {
   await preflightWorld();
-  const timer = setInterval(report, 60_000);
+  const timer = setInterval(() => { report(); void beat(); }, 60_000);
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
   if (DURATION > 0) setTimeout(stop, DURATION * 1000);
