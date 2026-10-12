@@ -26,6 +26,7 @@ import {
   parseSubmitHosts, sendUrl, fanoutOutcome, ALREADY_KNOWN, parseWaitingInterval, jitterDelay,
   type Emitted, type DeployExpect, type FileFate,
 } from './lib.js';
+import { toUnits, fromUnits, feeUnits, plan, destinationKey, GAS_LIMIT } from './sweep.js';
 
 let fails = 0;
 const check = (name: string, got: any, want: any) => {
@@ -341,6 +342,26 @@ const [lo, hi] = [Math.min(...draws), Math.max(...draws)];
 check('jitter: 10,000 random delays at the 2 s floor stay within 1.6-2.4 s, and spread across it', [lo >= 1600, hi <= 2400, lo < 1700, hi > 2300], [true, true, true, true]);
 check('runway model: reactive sending costs 189 gas per block', feederGasPerBlock(null), 189);
 check('runway model: a waiting attest every 10 s adds three no-ops, 552 gas per block', feederGasPerBlock(10), 552);
+
+// ---- the sweep's arithmetic (sweep.ts): exact decimals, never a float -------------------------------
+{
+  check('sweep: toUnits plain decimal', toUnits('4.52312136').toString(), '4523121360000');
+  check('sweep: toUnits integer', toUnits('22').toString(), '22000000000000');
+  check('sweep: fromUnits pads to 12 decimals', fromUnits(4523121360000n), '4.523121360000');
+  check('sweep: fromUnits round trip', fromUnits(toUnits('22.0235289')), '22.023528900000');
+  check('sweep: toUnits refuses an exponent', (() => { try { toUnits('1e-3'); return 'accepted'; } catch { return 'refused'; } })(), 'refused');
+  check('sweep: toUnits refuses 13 decimals', (() => { try { toUnits('0.1234567890123'); return 'accepted'; } catch { return 'refused'; } })(), 'refused');
+  check('sweep: fee = limit × price, mainnet price', fromUnits(feeUnits(GAS_LIMIT, 1e-7)), '0.000200000000');
+  check('sweep: fee = limit × price, devnet price', fromUnits(feeUnits(GAS_LIMIT, 1e-8)), '0.000020000000');
+  const fee = feeUnits(GAS_LIMIT, 1e-7);
+  check('sweep: plan moves balance minus fee', plan('2', '4.52312136', fee).amount, '4.522921360000');
+  check('sweep: plan leaves a dust balance', plan('2', '0.0001', fee), { chain: '2', balance: '0.0001', amount: null, note: 'only dust: 0.0001 does not cover the 0.000200000000 gas' });
+  check('sweep: plan leaves an exact-fee balance (nothing would move)', plan('2', '0.0002', fee).amount, null);
+  check('sweep: plan on an empty chain', plan('2', '0.0', fee), { chain: '2', balance: '0.0', amount: null, note: 'empty' });
+  check('sweep: destination key of a k: account', destinationKey('k:' + 'ab'.repeat(32)), 'ab'.repeat(32));
+  check('sweep: destination refuses a non-k account', (() => { try { destinationKey('w:abc'); return 'accepted'; } catch { return 'refused'; } })(), 'refused');
+  check('sweep: destination refuses a short key', (() => { try { destinationKey('k:' + 'ab'.repeat(31)); return 'accepted'; } catch { return 'refused'; } })(), 'refused');
+}
 
 console.log(fails ? `\n${fails} check(s) FAILED` : '\nall tool checks passed');
 process.exit(fails ? 1 : 0);

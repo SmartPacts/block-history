@@ -213,6 +213,7 @@ npm run deploy                    # devnet: creates + funds keys, deploys all ch
 npm run stream-check -- --seconds 240   # read-only: is the node's header stream alive for every chain?
 npm run balances -- k:<account>   # read-only: KDA per chain and feeder runway; unreachable ≠ zero
 npm run key-backup -- save out/feeder-key.json feeder-key.backup   # encrypted copy; also check, restore
+npm run sweep -- k:<account>      # move the feeder's whole balance, every chain, to one k: account; dry run unless --send
 npm run feeder                    # one process, all chains, SSE-driven; --duration N for a soak
 npm run oracle -- --last 600      # CONSISTENT / FAIL, coverage per chain
 npm run devnet-negatives -- --chain 2
@@ -339,6 +340,23 @@ polls in the same report are what say that. The ping has a 10-second deadline an
 into the feeder's loop, because monitoring that breaks what it monitors is worse than none; a ping
 that cannot be sent is logged once per outage, not once per report. The URL is a capability rather
 than a secret — whoever holds it can fake this feeder's heartbeat — so the feeder never prints it.
+
+### Stopping a recorder
+
+A recorder stops by stopping its process; nothing on chain changes. The module and every row it
+wrote stay, `latest` simply stops advancing, and the record continues the moment anyone calls
+`attest` again, from any account. The blocks in between are absent, like any block nobody attested.
+
+`npm run sweep -- k:<account>` returns what is left in the feeder's account: one `transfer-create`
+per chain to a `k:` account whose guard is derived from its name, for the balance minus the gas the
+transfer may buy. Without `--send` it only reads the balances and has the node preflight every
+transfer; with it, it submits them, waits for each to be mined, and reads both accounts back. A chain
+whose balance does not cover the gas is left alone and said so, and it refuses to run while the
+feeder service is active on the same machine, because the feeder spends from the same account.
+
+The operator's own recorder ran from the deploy on 2026-09-11 until 2026-10-12 and was then
+stopped, no consumer being left for it; the second recorder had already run out of gas. Both facts
+are readable in the record: every row's `by` names the account that paid for it.
 
 ### Deploying to a network — one pass
 

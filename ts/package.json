@@ -16,7 +16,8 @@
     "preflight": "tsx src/preflight.ts",
     "keygen": "tsx src/keygen.ts",
     "balances": "tsx src/balances.ts",
-    "key-backup": "tsx src/key-backup.ts"
+    "key-backup": "tsx src/key-backup.ts",
+    "sweep": "tsx src/sweep.ts"
   },
   "dependencies": {
     "@kadena/client": "1.18.3",
